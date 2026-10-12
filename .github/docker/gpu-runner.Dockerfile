@@ -122,6 +122,14 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
 #
 # Triton needs none of this: its wheel bundles ptxas and libdevice, and links
 # nothing from the toolkit.
+# gcc-13 / g++-13 are upgraded, not added: the base image froze them at 13.2,
+# and that host compiler rejects a `typename decltype(...)::difference_type`
+# construct in torch 2.11's ATen headers (ATen/core/List_inl.h). The same
+# compile against the same wheel's headers succeeds with 13.3, which is what
+# this image's toolchain was verified against; noble-updates carries it, so
+# naming the packages here pulls the parser fix in. The probe below prints the
+# compiler versions, so if this ever regresses the log names the version
+# instead of leaving a bare parse error.
 # python3.12-venv: the base ships the interpreter, but neither venv nor pip.
 RUN set -eux; \
     apt-get update; \
@@ -145,9 +153,17 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
         cuda-nvcc-13-3 \
         ${pins} \
+        gcc-13 g++-13 \
         python3.12-venv python3-pip; \
     nvcc --version; \
     apt-get clean; rm -rf /var/lib/apt/lists/*
+
+# Pin the host compiler for every build in this image -- the probe below and
+# the run-time DeepSpeed JIT alike. torch's cpp_extension passes $CC to nvcc
+# as -ccbin and uses $CXX for the C++ half, so naming the version here keeps a
+# build from silently picking up a different one, and makes the version the
+# probe logs the version the tests will compile with.
+ENV CC=gcc-13 CXX=g++-13
 
 # --- python environment ----------------------------------------------------
 # A venv rather than the image's python: the vendor site-packages stays as the
@@ -247,6 +263,9 @@ RUN set -eux; \
 # the loader path for the same libraries. TORCH_CUDA_ARCH_LIST only gives the
 # device-less build an architecture to target (sm_90, the H20); the build
 # directory is then removed so it cannot be mistaken for a cached operator.
+# The compiler versions are printed first: a parse error inside torch's own
+# headers is about the host compiler, and this names it (the image pins
+# CC/CXX, so these are also what the run-time JIT builds use).
 #
 # TORCH_DEVICE_BACKEND_AUTOLOAD=0 -- torch 2.11 imports out-of-tree device
 # backends on `import torch`, and this venv has one: flagcx, whose _C links
@@ -256,6 +275,8 @@ RUN set -eux; \
 # the backend autoload is a run-time concern, exercised by the GPU job. Only
 # this command gets the variable -- the image keeps torch's default.
 RUN set -eux; \
+    gcc --version | head -n 1; \
+    g++ --version | head -n 1; \
     TORCH_CUDA_ARCH_LIST=9.0 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import os, pathlib, tempfile; \
 import torch.utils.cpp_extension as ce; \
 from torch.utils.cpp_extension import load; \
