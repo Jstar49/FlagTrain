@@ -93,17 +93,20 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # --- compiler: nvcc + the CUDA libraries DeepSpeed's link line names --------
-# Not the cuda-toolkit-13-3 metapackage, and not the four -dev packages
-# unpinned either; the pieces are the ones the JIT builds actually touch
-# (deepspeed/ops/op_builder/builder.py: CUDAOpBuilder.cxx_args adds
-# -lcudart -lcublas and its extra_ldflags adds -lcurand -- fused_lamb inherits
-# both, ragged_device_ops inherits cxx_args -- and the ragged op includes
-# <ATen/cuda/CUDAContext.h>, which pulls in <cublas_v2.h>, so the headers are
-# needed as well as the unversioned .so names):
+# Not the cuda-toolkit-13-3 metapackage, and not the -dev packages unpinned
+# either. The pieces are the ones the JIT builds actually touch. DeepSpeed's
+# link line names three (deepspeed/ops/op_builder/builder.py:
+# CUDAOpBuilder.cxx_args adds -lcudart -lcublas, its extra_ldflags adds
+# -lcurand; fused_lamb inherits both, ragged_device_ops inherits cxx_args),
+# and torch's own headers add the rest -- both ops reach
+# <ATen/cuda/CUDAContext.h>, whose CUDAContextLight.h includes cusparse.h,
+# cublas_v2.h, cublasLt.h and cusolverDn.h:
 #   cuda-nvcc-13-3        the compiler itself
 #   cuda-cudart-dev-13-3  cuda_runtime.h and libcudart.so
 #   libcublas-dev-13-3    cublas_v2.h / cublasLt.h and libcublas.so
-#   libcurand-dev-13-3    curand.h and libcurand.so
+#   libcusparse-dev-13-3  cusparse.h
+#   libcusolver-dev-13-3  cusolverDn.h
+#   libcurand-dev-13-3    libcurand.so (curand.h is not included by anything)
 #
 # Each -dev package is pinned to a revision apt will actually accept, probed
 # in the loop below. Two rounds of failures led here, and both were the same
@@ -122,19 +125,18 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
 #
 # Triton needs none of this: its wheel bundles ptxas and libdevice, and links
 # nothing from the toolkit.
-# gcc-13 / g++-13 are upgraded, not added: the base image froze them at 13.2,
-# and that host compiler rejects a `typename decltype(...)::difference_type`
-# construct in torch 2.11's ATen headers (ATen/core/List_inl.h). The same
-# compile against the same wheel's headers succeeds with 13.3, which is what
-# this image's toolchain was verified against; noble-updates carries it, so
-# naming the packages here pulls the parser fix in. The probe below prints the
-# compiler versions, so if this ever regresses the log names the version
-# instead of leaving a bare parse error.
+# gcc-13 / g++-13 are named here to pull the current 13.x from noble-updates
+# (13.3) rather than the 13.2 the base image froze. The compiler turned out
+# *not* to be the cause of the header parse error this image used to hit --
+# that is the toolkit/C++ standard combination handled by NVCC_APPEND_FLAGS
+# below, and g++ 13.2 parses those headers fine -- but the upgrade stays so
+# the image's compiler is the version the rest of this toolchain was verified
+# against. The probe prints both versions, so no future failure has to guess.
 # python3.12-venv: the base ships the interpreter, but neither venv nor pip.
 RUN set -eux; \
     apt-get update; \
     pins=""; \
-    for dev in libcublas-dev-13-3 libcurand-dev-13-3 cuda-cudart-dev-13-3; do \
+    for dev in libcublas-dev-13-3 libcusparse-dev-13-3 libcusolver-dev-13-3 libcurand-dev-13-3 cuda-cudart-dev-13-3; do \
         version=""; \
         for candidate in $(apt-cache madison "${dev}" | awk '{print $3}' | sort -rVu); do \
             if apt-get install -y --dry-run --no-install-recommends "${dev}=${candidate}" >/dev/null 2>&1; then \
@@ -164,6 +166,25 @@ RUN set -eux; \
 # build from silently picking up a different one, and makes the version the
 # probe logs the version the tests will compile with.
 ENV CC=gcc-13 CXX=g++-13
+
+# Compile every nvcc invocation as C++20. torch's cpp_extension appends
+# -std=c++17 to its nvcc command line, and with this toolkit that combination
+# cannot compile torch 2.11's own headers: nvcc's front end rejects
+# ATen/core/List_inl.h's `static_cast<typename decltype(...)::difference_type>`
+# at C++17 and accepts it at C++20. Reproduced outside the image against this
+# toolkit's own nvcc and headers, in four runs: CUDA 13.3 + C++17 fails, CUDA
+# 13.3 + C++20 passes, CUDA 13.3 nvcc with CUDA 13.1 headers + C++17 passes,
+# CUDA 13.1 + C++17 passes -- so it is this toolkit under C++17, not the
+# compiler (g++ 13.3 is fine either way) and not the headers alone.
+# NVCC_APPEND_FLAGS is nvcc's own hook, so the flag lands after torch's and
+# wins -- nvcc reports "incompatible redefinition for option 'std', the last
+# value of this option was used" -- and being an nvcc variable it covers every
+# nvcc call in the image: the probe below and the DeepSpeed JIT builds at run
+# time. Verified end to end by building DeepSpeed's fused_lamb sources against
+# this toolkit with this variable set: compiles, links, imports. The plain C++
+# half needs nothing (checked compiling blocked_flash.cpp, which includes the
+# ATen CUDA headers too, at C++17).
+ENV NVCC_APPEND_FLAGS=-std=c++20
 
 # --- python environment ----------------------------------------------------
 # A venv rather than the image's python: the vendor site-packages stays as the
@@ -281,7 +302,7 @@ RUN set -eux; \
 import torch.utils.cpp_extension as ce; \
 from torch.utils.cpp_extension import load; \
 source = pathlib.Path(tempfile.mkdtemp(prefix="flagtrain-jit-probe-")) / "probe.cu"; \
-source.write_text("#include <cuda_runtime.h>\n#include <cublas_v2.h>\n#include <curand.h>\n#include <torch/extension.h>\n\n__global__ void probe_kernel() {}\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}\n"); \
+source.write_text("#include <cuda_runtime.h>\n#include <ATen/cuda/CUDAContext.h>\n#include <torch/extension.h>\n\n// ATen/cuda/CUDAContext.h is what both ops include; it pulls\n// cublas_v2.h, cublasLt.h, cusparse.h and cusolverDn.h.\n__global__ void probe_kernel() {}\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}\n"); \
 lib64 = os.path.join(ce.CUDA_HOME, "lib64"); \
 module = load(name="flagtrain_jit_probe", sources=[str(source)], extra_cflags=["-O0"], extra_cuda_cflags=["-O0"], extra_ldflags=["-L" + lib64, "-lcudart", "-lcublas", "-lcurand"], with_cuda=True, verbose=False); \
 print("JIT probe compiled, linked and imported:", module.__file__)'; \
