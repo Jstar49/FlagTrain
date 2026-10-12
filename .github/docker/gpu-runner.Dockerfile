@@ -247,8 +247,16 @@ RUN set -eux; \
 # the loader path for the same libraries. TORCH_CUDA_ARCH_LIST only gives the
 # device-less build an architecture to target (sm_90, the H20); the build
 # directory is then removed so it cannot be mistaken for a cached operator.
+#
+# TORCH_DEVICE_BACKEND_AUTOLOAD=0 -- torch 2.11 imports out-of-tree device
+# backends on `import torch`, and this venv has one: flagcx, whose _C links
+# libcuda.so.1. A build host has no driver (the container receives it from the
+# NVIDIA runtime at run time), so the autoload aborts the import before the
+# probe reaches the compiler. Disabling it scopes this check to the toolchain;
+# the backend autoload is a run-time concern, exercised by the GPU job. Only
+# this command gets the variable -- the image keeps torch's default.
 RUN set -eux; \
-    TORCH_CUDA_ARCH_LIST=9.0 python -c 'import os, pathlib, tempfile; \
+    TORCH_CUDA_ARCH_LIST=9.0 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import os, pathlib, tempfile; \
 import torch.utils.cpp_extension as ce; \
 from torch.utils.cpp_extension import load; \
 source = pathlib.Path(tempfile.mkdtemp(prefix="flagtrain-jit-probe-")) / "probe.cu"; \
@@ -262,12 +270,14 @@ print("JIT probe compiled, linked and imported:", module.__file__)'; \
 # Fail the build instead of the first CI job. torch.cuda.is_available() is
 # False on a build host with no device and is deliberately not asserted —
 # this image is not where the device path gets exercised.
+# TORCH_DEVICE_BACKEND_AUTOLOAD=0 for the same reason as the JIT probe above:
+# importing torch here must not try to load flagcx, which needs the driver.
 # The triton assertions are flagtree's install guard: a wheel whose files did
 # not land leaves an empty namespace package that imports without error, and
 # the venv check makes sure the module is flagtree's and not a stray system
 # triton that PATH happens to reach.
 RUN set -eux; \
-    python -c 'import sys, torch, triton, deepspeed, yaml, sqlalchemy, dskernels; \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import sys, torch, triton, deepspeed, yaml, sqlalchemy, dskernels; \
 assert triton.__file__ and hasattr(triton, "Config"), "triton install is incomplete"; \
 assert triton.__file__.startswith(sys.prefix), "triton came from outside the venv: " + str(triton.__file__); \
 assert torch.version.cuda == "13.0", torch.version.cuda; \
