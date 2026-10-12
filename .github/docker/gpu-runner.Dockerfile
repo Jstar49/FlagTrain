@@ -10,12 +10,12 @@
 # before this image existed, with the versions backends.yaml pins, baked in so
 # the workflows install NOTHING at run time:
 #
-#   - nvcc, plus the link stubs of the CUDA libraries DeepSpeed names, from
-#     four cuda-*-13-3 packages rather than the cuda-toolkit-13-3 metapackage
-#     (the reason is in the compiler section). The base is the NGC *runtime*
-#     tag: CUDA runtime libraries, no compiler. Both DeepSpeed ops the tests
-#     import (fused_lamb, ragged_device_ops) are JIT-built with nvcc on first
-#     use.
+#   - nvcc and the CUDA libraries DeepSpeed's link line names, from four
+#     individually pinned cuda-*-13-3 packages rather than the
+#     cuda-toolkit-13-3 metapackage (the reason is in the compiler section).
+#     The base is the NGC *runtime* tag: CUDA runtime libraries, no compiler.
+#     Both DeepSpeed ops the tests import (fused_lamb, ragged_device_ops) are
+#     JIT-built with nvcc on first use.
 #   - /opt/venv: python3.12 with torch 2.11.0+cu130, flagtree 0.7.0 (which is
 #     the `triton` module for this backend), flagcx, deepspeed 0.19.7 +
 #     deepspeed-kernels, and the test tooling (pytest, pyyaml, sqlalchemy).
@@ -92,34 +92,52 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     PIP_TRUSTED_HOST=resource.flagos.net \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# --- compiler: nvcc + the libraries DeepSpeed's link line names -------------
-# Four components instead of the cuda-toolkit-13-3 metapackage. The
-# metapackage's cuda-libraries(-dev)-13-3 revision requires libcublas-13-3
-# >= 13.6.0.2, while the CUDA mirror this base image points at can be serving
-# only 13.5.1.27 while it syncs -- apt then refuses the whole tree ("you have
-# held broken packages"), which is how the first CI build of this image died.
-# Resolving both sets against the repository index shows exactly that: the
-# metapackage unsatisfiable in the mid-sync state, this set installable in
-# both. The four are what DeepSpeed's op builders actually name
+# --- compiler: nvcc + the CUDA libraries DeepSpeed's link line names --------
+# Not the cuda-toolkit-13-3 metapackage, and not the four -dev packages
+# unpinned either; the pieces are the ones the JIT builds actually touch
 # (deepspeed/ops/op_builder/builder.py: CUDAOpBuilder.cxx_args adds
-# -lcudart -lcublas, its extra_ldflags adds -lcurand; fused_lamb inherits
-# both, ragged_device_ops inherits cxx_args):
+# -lcudart -lcublas and its extra_ldflags adds -lcurand -- fused_lamb inherits
+# both, ragged_device_ops inherits cxx_args -- and the ragged op includes
+# <ATen/cuda/CUDAContext.h>, which pulls in <cublas_v2.h>, so the headers are
+# needed as well as the unversioned .so names):
 #   cuda-nvcc-13-3        the compiler itself
 #   cuda-cudart-dev-13-3  cuda_runtime.h and libcudart.so
-#   libcublas-dev-13-3    libcublas.so, plus cublas_v2.h for sources that
-#                         include it
-#   libcurand-dev-13-3    libcurand.so
-# Their dependencies stay inside the 13-3 series, so no metapackage can pull
-# the install back into the skew. Triton needs none of them at run time: its
-# wheel bundles ptxas and libdevice, and links nothing from the toolkit.
+#   libcublas-dev-13-3    cublas_v2.h / cublasLt.h and libcublas.so
+#   libcurand-dev-13-3    curand.h and libcurand.so
+#
+# Each -dev package is PINNED, in the loop below, to the newest revision its
+# runtime half publishes. The CUDA repo ships the two halves of a library as
+# separate packages and syncs them separately, so mid-update the newest -dev
+# can require a runtime revision the mirror does not have yet. That is how
+# this build failed twice in a row: the cuda-toolkit metapackage
+# (cuda-libraries(-dev)-13-3) first, then libcublas-dev-13-3, both demanding
+# libcublas-13-3 >= 13.6.0.2 while only 13.5.1.27 was published. A revision
+# read off the runtime half is satisfiable by construction, and pinning all
+# three pairs pre-empts the next library NVIDIA updates the same way.
+#
+# Triton needs none of this: its wheel bundles ptxas and libdevice, and links
+# nothing from the toolkit.
 # python3.12-venv: the base ships the interpreter, but neither venv nor pip.
 RUN set -eux; \
     apt-get update; \
+    pins=""; \
+    for pair in \
+        "libcublas-dev-13-3:libcublas-13-3" \
+        "libcurand-dev-13-3:libcurand-13-3" \
+        "cuda-cudart-dev-13-3:cuda-cudart-13-3"; \
+    do \
+        dev="${pair%%:*}"; runtime_half="${pair##*:}"; \
+        version="$(apt-cache madison "${runtime_half}" | awk '{print $3}' | sort -Vu | tail -n 1)"; \
+        if [ -z "${version}" ]; then \
+            echo "ERROR: ${runtime_half} is not published, cannot pin ${dev}"; \
+            exit 1; \
+        fi; \
+        echo "pinning ${dev}=${version} (newest published ${runtime_half})"; \
+        pins="${pins} ${dev}=${version}"; \
+    done; \
     apt-get install -y --no-install-recommends \
         cuda-nvcc-13-3 \
-        cuda-cudart-dev-13-3 \
-        libcublas-dev-13-3 \
-        libcurand-dev-13-3 \
+        ${pins} \
         python3.12-venv python3-pip; \
     nvcc --version; \
     apt-get clean; rm -rf /var/lib/apt/lists/*
