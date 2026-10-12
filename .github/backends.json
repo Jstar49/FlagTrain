@@ -1,0 +1,11 @@
+[
+  {
+    "backend": "nvidia-cuda133",
+    "vendor": "nvidia",
+    "runner_label": "h20",
+    "command_aliases": ["h20", "a100"],
+    "label": "vendor/NVIDIA",
+    "gpu_check": "tools/gpu_check_nvidia.sh",
+    "enabled": true
+  }
+]

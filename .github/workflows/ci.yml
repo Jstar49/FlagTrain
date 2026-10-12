@@ -1,0 +1,199 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# GPU CI — the nvidia-cuda133 backend's suites (tests/deepspeed/).
+#
+# The gpu-test job builds .github/docker/gpu-runner.Dockerfile on the runner
+# and runs the tests inside that image: the environment is whatever the branch
+# describes, with no registry round-trip and no push step to keep in sync.
+# Docker's layer cache makes that affordable — from the second run on, only
+# the layers above the first changed line rebuild.
+#
+# How this differs from FlagGems' unittest.yaml, and why:
+#   - FlagTrain has a single backend (`.github/backends.json`), so there is no
+#     per-vendor matrix, and no vendor/* label gate: these suites run on every
+#     PR. Whether the GPU job runs at all is decided from the diff instead
+#     (docs-only changes skip it).
+#   - No secrets are used anywhere: a fork's PR builds and tests with the same
+#     command as a branch in this repository.
+#
+# The gpu-test-required job at the bottom is the check to require in branch
+# protection; see its comment for why the gpu-test job itself must not be.
+
+name: GPU CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One GPU machine: a new push to the same PR cancels the run it supersedes
+# instead of queueing behind it. Runs for different PRs still serialize on the
+# runner, which is what tools/gpu_check_nvidia.sh waits on.
+concurrency:
+  group: gpu-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preprocess:
+    # Runs on GitHub-hosted: deciding whether to spend the GPU must not itself
+    # spend the GPU, and this job needs no self-hosted hardware.
+    runs-on: ubuntu-latest
+    outputs:
+      run_gpu: ${{ steps.decide.outputs.run_gpu }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # changed-files diffs against the PR base; the default fetch-depth 1
+          # does not have that commit.
+          fetch-depth: 0
+
+      - id: changed-files
+        if: github.event_name != 'workflow_dispatch'
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96  # v47.0.6
+
+      - id: decide
+        shell: bash
+        env:
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: |
+          # A docs-only change cannot move a kernel, so it does not need the
+          # GPU. Every other outcome runs the tests, including "the diff could
+          # not be computed" — this must fail open.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual run: testing the ref as requested"
+            echo "run_gpu=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "${ALL_CHANGED_FILES}" ]; then
+            echo "no changed files reported: not skipping"
+            echo "run_gpu=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # grep -c exits 1 when it counts zero, which would fail the step.
+          non_docs=$(printf '%s\n' ${ALL_CHANGED_FILES} | grep -cvE '\.(md|rst)$|^docs/' || true)
+          if [ "${non_docs}" -eq 0 ]; then
+            echo "docs-only change: skipping the GPU job"
+            echo "run_gpu=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_gpu=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  gpu-test:
+    needs: preprocess
+    if: needs.preprocess.outputs.run_gpu == 'true'
+    # The nvidia-cuda133 machine — the same runner_label FlagGems' CUDA 13.3
+    # jobs use, and the host the image's driver/toolkit versions were chosen
+    # for (.github/backends.json).
+    runs-on: h20
+    # A cold image build (apt cuda-toolkit, torch, flagtree) plus the DeepSpeed
+    # JIT builds on their first run; warm runs finish in a few minutes. This is
+    # the ceiling for a stuck run, not the expected duration.
+    timeout-minutes: 120
+    env:
+      IMAGE: flagtrain-ci:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Check GPU availability
+        shell: bash
+        # The machine is shared, so wait for a card with >= 30 GB free (the
+        # script prints the per-GPU table and "Available GPUs: ...", and gives
+        # up after 10 minutes rather than holding the runner forever).
+        run: bash tools/gpu_check_nvidia.sh
+
+      - name: Build the CI image
+        shell: bash
+        # No --pull: the base image is pinned to a release tag, and re-pulling
+        # it every run would discard the layer cache that makes rebuilds
+        # cheap. If the base is ever re-tagged under the same name, remove the
+        # image on the runner once (docker rmi) so it is fetched again.
+        run: |
+          docker build \
+            -f .github/docker/gpu-runner.Dockerfile \
+            -t "${IMAGE}" \
+            .
+
+      - name: Run the correctness suites
+        shell: bash
+        run: |
+          # The image is the environment and the workspace is the code under
+          # test: the checkout is bind-mounted and pytest runs from it.
+          # pytest.ini puts src/ on sys.path, so nothing needs installing, and
+          # the suite's own imports (flag_train, its vendor backends) resolve
+          # from the mount.
+          #
+          # Everything the run writes goes outside the workspace, because the
+          # container runs as root while the workspace belongs to the runner
+          # user: root-owned files left behind would block the next job's
+          # checkout on a reused self-hosted workspace.
+          #   - results  -> $RUNNER_TEMP, uploaded as an artifact below
+          #   - caches   -> $FLAGTRAIN_CI_CACHE (override it if /tmp is small)
+          cache_root="${FLAGTRAIN_CI_CACHE:-/tmp/flagtrain-ci-cache}"
+          results="${RUNNER_TEMP}/flagtrain-results"
+          mkdir -p "${cache_root}/torch-extensions" "${cache_root}/triton-cache" "${results}"
+
+          # The two cache mounts are why the image pins TORCH_EXTENSIONS_DIR
+          # and TRITON_CACHE_DIR: DeepSpeed's JIT op builds (minutes) and
+          # Triton's compiled kernels survive between jobs on this machine.
+          # The DeepSpeed side is keyed by op name and nvcc flags, not by
+          # version — clear ${cache_root}/torch-extensions when the deepspeed
+          # pin in backends.yaml moves.
+          docker run --rm \
+            --gpus all \
+            --shm-size=2g \
+            -v "${GITHUB_WORKSPACE}:/work" -w /work \
+            -v "${results}:/out" \
+            -v "${cache_root}/torch-extensions:/opt/torch-extensions" \
+            -v "${cache_root}/triton-cache:/opt/triton-cache" \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            "${IMAGE}" \
+            pytest -v -p no:cacheprovider \
+              --record json --output /out/accuracy_result.json \
+              tests/
+
+      - name: Upload the accuracy report
+        # Always: a failing run's report is what says which case failed.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: accuracy-result
+          path: ${{ runner.temp }}/flagtrain-results/accuracy_result.json
+          if-no-files-found: ignore
+
+  # Gate job: gpu-test is skipped for docs-only changes, and GitHub does not
+  # count "skipped" as "passed" for a required status check — requiring
+  # gpu-test directly would leave those PRs pending forever. Require this job
+  # instead (the same pattern as FlagGems' unittest-required); it always runs
+  # and treats an upstream skip as a pass.
+  gpu-test-required:
+    needs: [preprocess, gpu-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs passed
+        shell: bash
+        run: |
+          echo '${{ toJSON(needs) }}' | jq .
+          failed=$(echo '${{ toJSON(needs) }}' | jq -r \
+            '[.[] | select(.result != "success" and .result != "skipped")] | length')
+          if [ "$failed" != "0" ]; then
+            echo "::error::One or more required jobs failed"
+            exit 1
+          fi

@@ -1,0 +1,18 @@
+pypi_base: "https://resource.flagos.net/repository/flagos-pypi-{vendor}/simple"
+mirror: "https://mirrors.aliyun.com/pypi/simple"
+
+backends:
+  nvidia-cuda133:
+    python: "3.12"
+    cmake_backend: CUDA
+    triton: triton==3.6.0
+    flagtree: flagtree==0.7.0
+    env:
+      PATH: /usr/local/cuda/bin:$PATH
+      LD_LIBRARY_PATH: /usr/local/cuda-13.3/compat:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+    deps:
+      - torch==2.11.0+cu130
+      - torchaudio==2.11.0+cu130
+      - torchvision==0.26.0+cu130
+      - deepspeed==0.19.7
+      - deepspeed-kernels==0.0.1
