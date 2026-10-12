@@ -105,15 +105,20 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
 #   libcublas-dev-13-3    cublas_v2.h / cublasLt.h and libcublas.so
 #   libcurand-dev-13-3    curand.h and libcurand.so
 #
-# Each -dev package is PINNED, in the loop below, to the newest revision its
-# runtime half publishes. The CUDA repo ships the two halves of a library as
-# separate packages and syncs them separately, so mid-update the newest -dev
-# can require a runtime revision the mirror does not have yet. That is how
-# this build failed twice in a row: the cuda-toolkit metapackage
-# (cuda-libraries(-dev)-13-3) first, then libcublas-dev-13-3, both demanding
-# libcublas-13-3 >= 13.6.0.2 while only 13.5.1.27 was published. A revision
-# read off the runtime half is satisfiable by construction, and pinning all
-# three pairs pre-empts the next library NVIDIA updates the same way.
+# Each -dev package is pinned to a revision apt will actually accept, probed
+# in the loop below. Two rounds of failures led here, and both were the same
+# shape -- a -dev half demanding a runtime revision the base image will not
+# install: the cuda-toolkit metapackage (cuda-libraries(-dev)-13-3, wanting
+# libcublas-13-3 >= 13.6.0.2) first, then libcublas-dev-13-3 wanting the same
+# thing with the CUDA repo publishing both 13.5.1.27 and 13.6.0.2. The second
+# failure is the informative one: both revisions are published, both have
+# satisfiable dependencies, and apt still chooses 13.5.1.27 -- this base image
+# keeps its CUDA runtime libraries where NGC pinned them, so the newest -dev
+# cannot be satisfied no matter what the repo offers. Pinning to a version
+# read off the repository therefore does not work; pinning to one apt has been
+# asked about does. For each -dev package the loop walks its published
+# revisions newest first and keeps the first that installs cleanly in a dry
+# run, then installs exactly that set.
 #
 # Triton needs none of this: its wheel bundles ptxas and libdevice, and links
 # nothing from the toolkit.
@@ -121,18 +126,20 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
 RUN set -eux; \
     apt-get update; \
     pins=""; \
-    for pair in \
-        "libcublas-dev-13-3:libcublas-13-3" \
-        "libcurand-dev-13-3:libcurand-13-3" \
-        "cuda-cudart-dev-13-3:cuda-cudart-13-3"; \
-    do \
-        dev="${pair%%:*}"; runtime_half="${pair##*:}"; \
-        version="$(apt-cache madison "${runtime_half}" | awk '{print $3}' | sort -Vu | tail -n 1)"; \
+    for dev in libcublas-dev-13-3 libcurand-dev-13-3 cuda-cudart-dev-13-3; do \
+        version=""; \
+        for candidate in $(apt-cache madison "${dev}" | awk '{print $3}' | sort -rVu); do \
+            if apt-get install -y --dry-run --no-install-recommends "${dev}=${candidate}" >/dev/null 2>&1; then \
+                version="${candidate}"; \
+                break; \
+            fi; \
+        done; \
         if [ -z "${version}" ]; then \
-            echo "ERROR: ${runtime_half} is not published, cannot pin ${dev}"; \
+            echo "ERROR: no published revision of ${dev} is installable against this base image"; \
+            apt-cache madison "${dev}"; \
             exit 1; \
         fi; \
-        echo "pinning ${dev}=${version} (newest published ${runtime_half})"; \
+        echo "pinning ${dev}=${version}"; \
         pins="${pins} ${dev}=${version}"; \
     done; \
     apt-get install -y --no-install-recommends \
