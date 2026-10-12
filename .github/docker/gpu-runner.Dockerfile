@@ -10,9 +10,12 @@
 # before this image existed, with the versions backends.yaml pins, baked in so
 # the workflows install NOTHING at run time:
 #
-#   - nvcc from cuda-toolkit-13-3. The base is the NGC *runtime* tag: CUDA
-#     runtime libraries, no compiler. Both DeepSpeed ops the tests import
-#     (fused_lamb, ragged_device_ops) are JIT-built with nvcc on first use.
+#   - nvcc, plus the link stubs of the CUDA libraries DeepSpeed names, from
+#     four cuda-*-13-3 packages rather than the cuda-toolkit-13-3 metapackage
+#     (the reason is in the compiler section). The base is the NGC *runtime*
+#     tag: CUDA runtime libraries, no compiler. Both DeepSpeed ops the tests
+#     import (fused_lamb, ragged_device_ops) are JIT-built with nvcc on first
+#     use.
 #   - /opt/venv: python3.12 with torch 2.11.0+cu130, flagtree 0.7.0 (which is
 #     the `triton` module for this backend), flagcx, deepspeed 0.19.7 +
 #     deepspeed-kernels, and the test tooling (pytest, pyyaml, sqlalchemy).
@@ -89,17 +92,34 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     PIP_TRUSTED_HOST=resource.flagos.net \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# --- compiler: nvcc for the DeepSpeed JIT builds ---------------------------
-# cuda-toolkit-13-3, not the unversioned cuda-toolkit: the latter tracks the
-# newest 13.x NVIDIA publishes and would drift away from this image's 13.3
-# runtime libraries and torch's cu130 build. The full toolkit is what the
-# host-verified recipe used; if the image size becomes a problem, the pieces
-# the JIT builds actually need are cuda-nvcc-13-3 + cuda-cudart-dev-13-3.
+# --- compiler: nvcc + the libraries DeepSpeed's link line names -------------
+# Four components instead of the cuda-toolkit-13-3 metapackage. The
+# metapackage's cuda-libraries(-dev)-13-3 revision requires libcublas-13-3
+# >= 13.6.0.2, while the CUDA mirror this base image points at can be serving
+# only 13.5.1.27 while it syncs -- apt then refuses the whole tree ("you have
+# held broken packages"), which is how the first CI build of this image died.
+# Resolving both sets against the repository index shows exactly that: the
+# metapackage unsatisfiable in the mid-sync state, this set installable in
+# both. The four are what DeepSpeed's op builders actually name
+# (deepspeed/ops/op_builder/builder.py: CUDAOpBuilder.cxx_args adds
+# -lcudart -lcublas, its extra_ldflags adds -lcurand; fused_lamb inherits
+# both, ragged_device_ops inherits cxx_args):
+#   cuda-nvcc-13-3        the compiler itself
+#   cuda-cudart-dev-13-3  cuda_runtime.h and libcudart.so
+#   libcublas-dev-13-3    libcublas.so, plus cublas_v2.h for sources that
+#                         include it
+#   libcurand-dev-13-3    libcurand.so
+# Their dependencies stay inside the 13-3 series, so no metapackage can pull
+# the install back into the skew. Triton needs none of them at run time: its
+# wheel bundles ptxas and libdevice, and links nothing from the toolkit.
 # python3.12-venv: the base ships the interpreter, but neither venv nor pip.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        cuda-toolkit-13-3 \
+        cuda-nvcc-13-3 \
+        cuda-cudart-dev-13-3 \
+        libcublas-dev-13-3 \
+        libcurand-dev-13-3 \
         python3.12-venv python3-pip; \
     nvcc --version; \
     apt-get clean; rm -rf /var/lib/apt/lists/*
@@ -191,6 +211,27 @@ RUN set -eux; \
 RUN set -eux; \
     pip install --no-cache-dir "setuptools>=77,<82"; \
     python -c "import setuptools; print('setuptools', setuptools.__version__)"
+
+# --- verify the JIT toolchain can compile and link a CUDA extension --------
+# The one thing this image's toolchain has to get right is building a CUDA
+# extension, because importing the correctness suites JIT-builds fused_lamb
+# and ragged_device_ops on first use. A missing header, or a library whose dev
+# symlink the slim package set dropped, fails here at build time instead of in
+# the first GPU job. The flags are the ones DeepSpeed's builders pass;
+# compiling and linking needs no device, and importing the result exercises
+# the loader path for the same libraries. TORCH_CUDA_ARCH_LIST only gives the
+# device-less build an architecture to target (sm_90, the H20); the build
+# directory is then removed so it cannot be mistaken for a cached operator.
+RUN set -eux; \
+    TORCH_CUDA_ARCH_LIST=9.0 python -c 'import os, pathlib, tempfile; \
+import torch.utils.cpp_extension as ce; \
+from torch.utils.cpp_extension import load; \
+source = pathlib.Path(tempfile.mkdtemp(prefix="flagtrain-jit-probe-")) / "probe.cu"; \
+source.write_text("#include <cuda_runtime.h>\n#include <cublas_v2.h>\n#include <curand.h>\n#include <torch/extension.h>\n\n__global__ void probe_kernel() {}\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}\n"); \
+lib64 = os.path.join(ce.CUDA_HOME, "lib64"); \
+module = load(name="flagtrain_jit_probe", sources=[str(source)], extra_cflags=["-O0"], extra_cuda_cflags=["-O0"], extra_ldflags=["-L" + lib64, "-lcudart", "-lcublas", "-lcurand"], with_cuda=True, verbose=False); \
+print("JIT probe compiled, linked and imported:", module.__file__)'; \
+    rm -rf "${HOME:-/root}/.cache/torch_extensions"
 
 # --- verification ----------------------------------------------------------
 # Fail the build instead of the first CI job. torch.cuda.is_available() is
