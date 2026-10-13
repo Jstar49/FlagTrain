@@ -22,9 +22,12 @@
 #
 # How this differs from FlagGems' unittest.yaml, and why:
 #   - FlagTrain has a single backend (`.github/backends.json`), so there is no
-#     per-vendor matrix, and no vendor/* label gate: these suites run on every
-#     PR. Whether the GPU job runs at all is decided from the diff instead
-#     (docs-only changes skip it).
+#     per-vendor matrix and no vendor/* label gate. Instead of FlagGems'
+#     label-gated python-op job, the diff is scoped like FlagGems'
+#     tools/test-op.sh does it: tools/ci_checks/select_changed_tests.py maps the
+#     changed files onto the operators they touch, and the GPU job runs only
+#     those operators' functional tests and benchmarks (an infra-only or
+#     uncomputable diff fails open and runs everything; docs-only skips).
 #   - No secrets are used anywhere: a fork's PR builds and tests with the same
 #     command as a branch in this repository.
 #
@@ -57,6 +60,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run_gpu: ${{ steps.decide.outputs.run_gpu }}
+      test_targets: ${{ steps.decide.outputs.test_targets }}
+      bench_targets: ${{ steps.decide.outputs.bench_targets }}
+      changed_ops: ${{ steps.decide.outputs.changed_ops }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -73,27 +79,18 @@ jobs:
         env:
           ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
         run: |
-          # A docs-only change cannot move a kernel, so it does not need the
-          # GPU. Every other outcome runs the tests, including "the diff could
-          # not be computed" — this must fail open.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "manual run: testing the ref as requested"
-            echo "run_gpu=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ -z "${ALL_CHANGED_FILES}" ]; then
-            echo "no changed files reported: not skipping"
-            echo "run_gpu=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # grep -c exits 1 when it counts zero, which would fail the step.
-          non_docs=$(printf '%s\n' ${ALL_CHANGED_FILES} | grep -cvE '\.(md|rst)$|^docs/' || true)
-          if [ "${non_docs}" -eq 0 ]; then
-            echo "docs-only change: skipping the GPU job"
-            echo "run_gpu=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_gpu=true" >> "$GITHUB_OUTPUT"
-          fi
+          # Classify the diff into the operator tests/benchmarks it touches and
+          # write run_gpu / test_targets / bench_targets to GITHUB_OUTPUT. This
+          # reproduces FlagGems' tools/test-op.sh classification (changed test
+          # file -> functional, benchmark file -> perf, op impl -> its marker)
+          # for FlagTrain's flat operator space, where impl/test/benchmark map
+          # 1:1 by filename stem. See the script's docstring for the matrix:
+          #   - docs-only change          -> skip the GPU
+          #   - touched operators         -> only those operators
+          #   - infra-only / no diff      -> fail open, run everything
+          python3 tools/ci_checks/select_changed_tests.py \
+            --event-name "${{ github.event_name }}" \
+            --changed-files "${ALL_CHANGED_FILES}"
 
   gpu-test:
     needs: preprocess
@@ -130,8 +127,11 @@ jobs:
             -t "${IMAGE}" \
             .
 
-      - name: Run the correctness suites
+      - name: Run the correctness and performance suites
         shell: bash
+        env:
+          TEST_TARGETS: ${{ needs.preprocess.outputs.test_targets }}
+          BENCH_TARGETS: ${{ needs.preprocess.outputs.bench_targets }}
         run: |
           # The image is the environment and the workspace is the code under
           # test: the checkout is bind-mounted and pytest runs from it.
@@ -155,18 +155,67 @@ jobs:
           # The DeepSpeed side is keyed by op name and nvcc flags, not by
           # version — clear ${cache_root}/torch-extensions when the deepspeed
           # pin in backends.yaml moves.
-          docker run --rm \
-            --gpus all \
-            --shm-size=2g \
-            -v "${GITHUB_WORKSPACE}:/work" -w /work \
-            -v "${results}:/out" \
-            -v "${cache_root}/torch-extensions:/opt/torch-extensions" \
-            -v "${cache_root}/triton-cache:/opt/triton-cache" \
-            -e PYTHONDONTWRITEBYTECODE=1 \
-            "${IMAGE}" \
-            pytest -v -p no:cacheprovider \
+          docker_opts=(--rm --gpus all --shm-size=2g
+            -v "${GITHUB_WORKSPACE}:/work"
+            -v "${results}:/out"
+            -v "${cache_root}/torch-extensions:/opt/torch-extensions"
+            -v "${cache_root}/triton-cache:/opt/triton-cache"
+            -e PYTHONDONTWRITEBYTECODE=1)
+
+          # Scoped PRs fail fast (-x), like FlagGems' per-PR test-op.sh; a full
+          # run (push to main, manual dispatch, infra-only diff) keeps going and
+          # reports every failure.
+          if [ "${TEST_TARGETS}" = "__ALL__" ] || [ -z "${TEST_TARGETS}" ]; then
+            test_targets="tests/"
+            extra_opts=""
+            fail_fast=false
+          else
+            test_targets="${TEST_TARGETS}"
+            extra_opts="-x"
+            fail_fast=true
+          fi
+
+          failures=0
+
+          # Correctness, device reference.
+          echo "correctness targets: ${test_targets}"
+          docker run "${docker_opts[@]}" -w /work "${IMAGE}" \
+            pytest -v -p no:cacheprovider ${extra_opts} \
               --record json --output /out/accuracy_result.json \
-              tests/
+              ${test_targets} || failures=$((failures + 1))
+          if [ "${fail_fast}" = "true" ] && [ "${failures}" -ne 0 ]; then exit 1; fi
+
+          # Correctness, quick-CPU reference: FlagGems' second functional pass,
+          # where the reference runs on the CPU (--ref=cpu) with reduced shapes
+          # (--quick).
+          echo "quick-cpu targets: ${test_targets} (--ref=cpu --quick)"
+          docker run "${docker_opts[@]}" -w /work "${IMAGE}" \
+            pytest -v -p no:cacheprovider ${extra_opts} \
+              ${test_targets} --ref=cpu --quick || failures=$((failures + 1))
+          if [ "${fail_fast}" = "true" ] && [ "${failures}" -ne 0 ]; then exit 1; fi
+
+          # Performance, FlagGems' mode: --level core --record log. Runs with
+          # /out as the working dir so the log lands outside the workspace.
+          if [ "${BENCH_TARGETS}" = "__ALL__" ]; then
+            bench_targets="benchmark/deepspeed/"
+          else
+            bench_targets="${BENCH_TARGETS}"
+          fi
+          if [ -n "${bench_targets}" ]; then
+            bench_abs=""
+            for b in ${bench_targets}; do bench_abs="${bench_abs} /work/${b}"; done
+            echo "performance targets: ${bench_targets}"
+            docker run "${docker_opts[@]}" -w /out "${IMAGE}" \
+              pytest -v -p no:cacheprovider ${extra_opts} --level core \
+                --record log ${bench_abs} || failures=$((failures + 1))
+          else
+            echo "no performance targets for this change; skipping the performance suites"
+          fi
+
+          if [ "${failures}" -ne 0 ]; then
+            echo "::error::${failures} correctness/performance suite(s) failed"
+            exit 1
+          fi
 
       - name: Upload the accuracy report
         # Always: a failing run's report is what says which case failed.

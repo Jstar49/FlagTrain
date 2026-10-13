@@ -10,9 +10,12 @@
 # before this image existed, with the versions backends.yaml pins, baked in so
 # the workflows install NOTHING at run time:
 #
-#   - nvcc from cuda-toolkit-13-3. The base is the NGC *runtime* tag: CUDA
-#     runtime libraries, no compiler. Both DeepSpeed ops the tests import
-#     (fused_lamb, ragged_device_ops) are JIT-built with nvcc on first use.
+#   - nvcc and the CUDA libraries DeepSpeed's link line names, from four
+#     individually pinned cuda-*-13-3 packages rather than the
+#     cuda-toolkit-13-3 metapackage (the reason is in the compiler section).
+#     The base is the NGC *runtime* tag: CUDA runtime libraries, no compiler.
+#     Both DeepSpeed ops the tests import (fused_lamb, ragged_device_ops) are
+#     JIT-built with nvcc on first use.
 #   - /opt/venv: python3.12 with torch 2.11.0+cu130, flagtree 0.7.0 (which is
 #     the `triton` module for this backend), flagcx, deepspeed 0.19.7 +
 #     deepspeed-kernels, and the test tooling (pytest, pyyaml, sqlalchemy).
@@ -89,20 +92,99 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     PIP_TRUSTED_HOST=resource.flagos.net \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# --- compiler: nvcc for the DeepSpeed JIT builds ---------------------------
-# cuda-toolkit-13-3, not the unversioned cuda-toolkit: the latter tracks the
-# newest 13.x NVIDIA publishes and would drift away from this image's 13.3
-# runtime libraries and torch's cu130 build. The full toolkit is what the
-# host-verified recipe used; if the image size becomes a problem, the pieces
-# the JIT builds actually need are cuda-nvcc-13-3 + cuda-cudart-dev-13-3.
+# --- compiler: nvcc + the CUDA libraries DeepSpeed's link line names --------
+# Not the cuda-toolkit-13-3 metapackage, and not the -dev packages unpinned
+# either. The pieces are the ones the JIT builds actually touch. DeepSpeed's
+# link line names three (deepspeed/ops/op_builder/builder.py:
+# CUDAOpBuilder.cxx_args adds -lcudart -lcublas, its extra_ldflags adds
+# -lcurand; fused_lamb inherits both, ragged_device_ops inherits cxx_args),
+# and torch's own headers add the rest -- both ops reach
+# <ATen/cuda/CUDAContext.h>, whose CUDAContextLight.h includes cusparse.h,
+# cublas_v2.h, cublasLt.h and cusolverDn.h:
+#   cuda-nvcc-13-3        the compiler itself
+#   cuda-cudart-dev-13-3  cuda_runtime.h and libcudart.so
+#   libcublas-dev-13-3    cublas_v2.h / cublasLt.h and libcublas.so
+#   libcusparse-dev-13-3  cusparse.h
+#   libcusolver-dev-13-3  cusolverDn.h
+#   libcurand-dev-13-3    libcurand.so (curand.h is not included by anything)
+#
+# Each -dev package is pinned to a revision apt will actually accept, probed
+# in the loop below. Two rounds of failures led here, and both were the same
+# shape -- a -dev half demanding a runtime revision the base image will not
+# install: the cuda-toolkit metapackage (cuda-libraries(-dev)-13-3, wanting
+# libcublas-13-3 >= 13.6.0.2) first, then libcublas-dev-13-3 wanting the same
+# thing with the CUDA repo publishing both 13.5.1.27 and 13.6.0.2. The second
+# failure is the informative one: both revisions are published, both have
+# satisfiable dependencies, and apt still chooses 13.5.1.27 -- this base image
+# keeps its CUDA runtime libraries where NGC pinned them, so the newest -dev
+# cannot be satisfied no matter what the repo offers. Pinning to a version
+# read off the repository therefore does not work; pinning to one apt has been
+# asked about does. For each -dev package the loop walks its published
+# revisions newest first and keeps the first that installs cleanly in a dry
+# run, then installs exactly that set.
+#
+# Triton needs none of this: its wheel bundles ptxas and libdevice, and links
+# nothing from the toolkit.
+# gcc-13 / g++-13 are named here to pull the current 13.x from noble-updates
+# (13.3) rather than the 13.2 the base image froze. The compiler turned out
+# *not* to be the cause of the header parse error this image used to hit --
+# that is the toolkit/C++ standard combination handled by NVCC_APPEND_FLAGS
+# below, and g++ 13.2 parses those headers fine -- but the upgrade stays so
+# the image's compiler is the version the rest of this toolchain was verified
+# against. The probe prints both versions, so no future failure has to guess.
 # python3.12-venv: the base ships the interpreter, but neither venv nor pip.
 RUN set -eux; \
     apt-get update; \
+    pins=""; \
+    for dev in libcublas-dev-13-3 libcusparse-dev-13-3 libcusolver-dev-13-3 libcurand-dev-13-3 cuda-cudart-dev-13-3; do \
+        version=""; \
+        for candidate in $(apt-cache madison "${dev}" | awk '{print $3}' | sort -rVu); do \
+            if apt-get install -y --dry-run --no-install-recommends "${dev}=${candidate}" >/dev/null 2>&1; then \
+                version="${candidate}"; \
+                break; \
+            fi; \
+        done; \
+        if [ -z "${version}" ]; then \
+            echo "ERROR: no published revision of ${dev} is installable against this base image"; \
+            apt-cache madison "${dev}"; \
+            exit 1; \
+        fi; \
+        echo "pinning ${dev}=${version}"; \
+        pins="${pins} ${dev}=${version}"; \
+    done; \
     apt-get install -y --no-install-recommends \
-        cuda-toolkit-13-3 \
+        cuda-nvcc-13-3 \
+        ${pins} \
+        gcc-13 g++-13 \
         python3.12-venv python3-pip; \
     nvcc --version; \
     apt-get clean; rm -rf /var/lib/apt/lists/*
+
+# Pin the host compiler for every build in this image -- the probe below and
+# the run-time DeepSpeed JIT alike. torch's cpp_extension passes $CC to nvcc
+# as -ccbin and uses $CXX for the C++ half, so naming the version here keeps a
+# build from silently picking up a different one, and makes the version the
+# probe logs the version the tests will compile with.
+ENV CC=gcc-13 CXX=g++-13
+
+# Compile every nvcc invocation as C++20. torch's cpp_extension appends
+# -std=c++17 to its nvcc command line, and with this toolkit that combination
+# cannot compile torch 2.11's own headers: nvcc's front end rejects
+# ATen/core/List_inl.h's `static_cast<typename decltype(...)::difference_type>`
+# at C++17 and accepts it at C++20. Reproduced outside the image against this
+# toolkit's own nvcc and headers, in four runs: CUDA 13.3 + C++17 fails, CUDA
+# 13.3 + C++20 passes, CUDA 13.3 nvcc with CUDA 13.1 headers + C++17 passes,
+# CUDA 13.1 + C++17 passes -- so it is this toolkit under C++17, not the
+# compiler (g++ 13.3 is fine either way) and not the headers alone.
+# NVCC_APPEND_FLAGS is nvcc's own hook, so the flag lands after torch's and
+# wins -- nvcc reports "incompatible redefinition for option 'std', the last
+# value of this option was used" -- and being an nvcc variable it covers every
+# nvcc call in the image: the probe below and the DeepSpeed JIT builds at run
+# time. Verified end to end by building DeepSpeed's fused_lamb sources against
+# this toolkit with this variable set: compiles, links, imports. The plain C++
+# half needs nothing (checked compiling blocked_flash.cpp, which includes the
+# ATen CUDA headers too, at C++17).
+ENV NVCC_APPEND_FLAGS=-std=c++20
 
 # --- python environment ----------------------------------------------------
 # A venv rather than the image's python: the vendor site-packages stays as the
@@ -192,16 +274,52 @@ RUN set -eux; \
     pip install --no-cache-dir "setuptools>=77,<82"; \
     python -c "import setuptools; print('setuptools', setuptools.__version__)"
 
+# --- verify the JIT toolchain can compile and link a CUDA extension --------
+# The one thing this image's toolchain has to get right is building a CUDA
+# extension, because importing the correctness suites JIT-builds fused_lamb
+# and ragged_device_ops on first use. A missing header, or a library whose dev
+# symlink the slim package set dropped, fails here at build time instead of in
+# the first GPU job. The flags are the ones DeepSpeed's builders pass;
+# compiling and linking needs no device, and importing the result exercises
+# the loader path for the same libraries. TORCH_CUDA_ARCH_LIST only gives the
+# device-less build an architecture to target (sm_90, the H20); the build
+# directory is then removed so it cannot be mistaken for a cached operator.
+# The compiler versions are printed first: a parse error inside torch's own
+# headers is about the host compiler, and this names it (the image pins
+# CC/CXX, so these are also what the run-time JIT builds use).
+#
+# TORCH_DEVICE_BACKEND_AUTOLOAD=0 -- torch 2.11 imports out-of-tree device
+# backends on `import torch`, and this venv has one: flagcx, whose _C links
+# libcuda.so.1. A build host has no driver (the container receives it from the
+# NVIDIA runtime at run time), so the autoload aborts the import before the
+# probe reaches the compiler. Disabling it scopes this check to the toolchain;
+# the backend autoload is a run-time concern, exercised by the GPU job. Only
+# this command gets the variable -- the image keeps torch's default.
+RUN set -eux; \
+    gcc --version | head -n 1; \
+    g++ --version | head -n 1; \
+    TORCH_CUDA_ARCH_LIST=9.0 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import os, pathlib, tempfile; \
+import torch.utils.cpp_extension as ce; \
+from torch.utils.cpp_extension import load; \
+source = pathlib.Path(tempfile.mkdtemp(prefix="flagtrain-jit-probe-")) / "probe.cu"; \
+source.write_text("#include <cuda_runtime.h>\n#include <ATen/cuda/CUDAContext.h>\n#include <torch/extension.h>\n\n// ATen/cuda/CUDAContext.h is what both ops include; it pulls\n// cublas_v2.h, cublasLt.h, cusparse.h and cusolverDn.h.\n__global__ void probe_kernel() {}\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}\n"); \
+lib64 = os.path.join(ce.CUDA_HOME, "lib64"); \
+module = load(name="flagtrain_jit_probe", sources=[str(source)], extra_cflags=["-O0"], extra_cuda_cflags=["-O0"], extra_ldflags=["-L" + lib64, "-lcudart", "-lcublas", "-lcurand"], with_cuda=True, verbose=False); \
+print("JIT probe compiled, linked and imported:", module.__file__)'; \
+    rm -rf "${HOME:-/root}/.cache/torch_extensions"
+
 # --- verification ----------------------------------------------------------
 # Fail the build instead of the first CI job. torch.cuda.is_available() is
 # False on a build host with no device and is deliberately not asserted —
 # this image is not where the device path gets exercised.
+# TORCH_DEVICE_BACKEND_AUTOLOAD=0 for the same reason as the JIT probe above:
+# importing torch here must not try to load flagcx, which needs the driver.
 # The triton assertions are flagtree's install guard: a wheel whose files did
 # not land leaves an empty namespace package that imports without error, and
 # the venv check makes sure the module is flagtree's and not a stray system
 # triton that PATH happens to reach.
 RUN set -eux; \
-    python -c 'import sys, torch, triton, deepspeed, yaml, sqlalchemy, dskernels; \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import sys, torch, triton, deepspeed, yaml, sqlalchemy, dskernels; \
 assert triton.__file__ and hasattr(triton, "Config"), "triton install is incomplete"; \
 assert triton.__file__.startswith(sys.prefix), "triton came from outside the venv: " + str(triton.__file__); \
 assert torch.version.cuda == "13.0", torch.version.cuda; \
