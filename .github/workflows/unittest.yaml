@@ -50,6 +50,10 @@ name: unit-test
 
 permissions:
   contents: read
+  # The wait-for-triage step lists workflow runs, and that endpoint requires
+  # actions:read; without it GitHub answers 404 ("Not Found") rather than 403,
+  # which reads like a missing workflow.
+  actions: read
 
 on:
   workflow_dispatch:
@@ -91,8 +95,16 @@ jobs:
       # skipped merely because labeling had not happened yet. Only PRs are
       # labelled, so only PRs wait -- on push/dispatch there is no triage run
       # to wait for.
+      #
+      # Best-effort on purpose: the lookup needs triage.yaml to exist on the
+      # default branch, so the first PR that carries the file (this one, and
+      # any PR branched before triage lands) gets a 404 here. Failing the test
+      # job over that would be worse than what it costs -- labels read at their
+      # current value, so at worst one run schedules fewer backends, and the
+      # vendor entries are disabled until their runners exist anyway.
       - id: wait-for-triage
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         uses: ArcticLampyrid/action-wait-for-workflow@ff297b23789206858260877c4b83026d90c6db8c  # v1.3.0
         with:
           workflow: .github/workflows/triage.yaml
