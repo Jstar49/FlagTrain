@@ -35,6 +35,12 @@ backends:
     triton: triton==3.5.0
     flagtree: flagtree==0.7.0+ascend3.5
     env_source:
+      # Candidates, first existing one wins: CANN's installer has shipped its
+      # setup script under both of these. Whichever it is must be sourced --
+      # torch_npu reads CANN's paths while torch imports it, and without them
+      # the import dies with a UnicodeDecodeError instead of a missing-SDK
+      # message.
+      - /usr/local/Ascend/ascend-toolkit/set_env.sh
       - /usr/local/Ascend/cann/set_env.sh
     deps:
       # FlagGems' cann900 list in full: the vendor wheels do not declare these

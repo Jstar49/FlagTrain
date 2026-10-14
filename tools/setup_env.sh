@@ -74,7 +74,12 @@ case "${2:-}" in
 esac
 
 emit_env() {
-    # KEY=VALUE: into $GITHUB_ENV in CI, printed for local `eval`.
+    # KEY=VALUE: applied to this shell AND handed to the steps after it.
+    # Both are needed: the installs and the import check at the end of this
+    # very step run here, and a vendor stack can read its environment at import
+    # time -- torch_npu reads CANN's paths while torch imports it, and without
+    # ASCEND_* it dies with a UnicodeDecodeError from a garbage path.
+    export "$1"
     if [ -n "${GITHUB_ENV:-}" ]; then
         echo "$1" >>"${GITHUB_ENV}"
     else
@@ -87,6 +92,7 @@ MIRROR=""
 DEPS=""
 COMPILER_PKG=""
 ENV_SOURCES=""
+sourced_env=""
 
 while IFS=$'\t' read -r kind a b; do
     case "${kind}" in
@@ -98,6 +104,7 @@ while IFS=$'\t' read -r kind a b; do
         ENV)
             echo "backend env ${a}=${b}"
             emit_env "${a}=${b}"
+            sourced_env="${sourced_env} ${a}=${b}"
             ;;
     esac
 done < <(python3 - "${BACKENDS_YAML}" "${BACKEND}" <<'PY'
@@ -161,18 +168,50 @@ for name, value in (backend.get("env") or {}).items():
 PY
 )
 
+# env_source entries are candidates in priority order -- different installers
+# put the vendor's setup script in different places (CANN ships it under both
+# ascend-toolkit/ and cann/) -- so the first one that exists is used and the
+# rest are ignored, rather than sourcing several and prepending PATH twice.
 for script in ${ENV_SOURCES}; do
     if [ ! -f "${script}" ]; then
-        echo "env_source ${script} is not present in this image; skipping"
         continue
     fi
     echo "sourcing ${script}"
     while IFS= read -r line; do
         case "${line}" in
-            "export "*) emit_env "${line#export }" ;;
+            "export "*)
+                emit_env "${line#export }"
+                sourced_env="${sourced_env} ${line#export }"
+                ;;
         esac
     done < <(bash "${REPO_ROOT}/tools/source_env_bash.sh" "${script}")
+    break
 done
+
+if [ -n "${ENV_SOURCES}" ] && [ -z "${sourced_env}" ]; then
+    if [ "${PREBUILT}" -eq 0 ]; then
+        # The stack being installed here needs that environment, and letting
+        # the run continue only moves the failure into a vendor import with a
+        # baffling error message.
+        echo "ERROR: none of this backend's env_source scripts exist on this machine:" >&2
+        for script in ${ENV_SOURCES}; do
+            echo "         ${script}" >&2
+        done
+        echo "       Install the vendor SDK on the runner, or point env_source at where it" >&2
+        echo "       actually landed (backends.yaml)." >&2
+        exit 1
+    fi
+    # A prebuilt image is expected to carry that environment itself.
+    echo "note: no env_source script found; the image is expected to provide that environment"
+fi
+
+# What the vendor environment contributed. An import failure later in this step
+# (or in pytest) prints the values it failed with alongside it.
+if [ -n "${sourced_env}" ]; then
+    for pair in ${sourced_env}; do
+        echo "  env ${pair%%=*}=${pair#*=}"
+    done
+fi
 
 pip_args=(--no-cache-dir)
 if [ -n "${FLAGOS_PYPI}" ]; then
