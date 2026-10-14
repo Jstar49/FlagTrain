@@ -35,10 +35,30 @@ backends:
     triton: triton==3.5.0
     flagtree: flagtree==0.7.0+ascend3.5
     env_source:
+      # Candidates, first existing one wins: CANN's installer has shipped its
+      # setup script under both of these. Whichever it is must be sourced --
+      # torch_npu reads CANN's paths while torch imports it, and without them
+      # the import dies with a UnicodeDecodeError instead of a missing-SDK
+      # message.
+      - /usr/local/Ascend/ascend-toolkit/set_env.sh
       - /usr/local/Ascend/cann/set_env.sh
     deps:
+      # FlagGems' cann900 list in full: the vendor wheels do not declare these
+      # themselves, but torch-npu imports decorator/attrs/psutil at run time
+      # and cann-shmem backs its shared-memory paths. Trimming the list to what
+      # the tests import is what left the first native ascend venv without the
+      # vendor's own runtime deps; the shared test dependencies (including
+      # numpy) are installed by tools/setup_env.sh on top of this.
       - torch==2.10.0+cpu
       - torch-npu==2.10.0
+      - cann-shmem==1.6.0
+      - decorator==5.1.1
+      - attrs==24.2.0
+      - psutil==6.0.0
+      # Same numpy the ascend runtime image ships (build-infra's pin). It is
+      # installed after the shared test dependencies, so it decides the final
+      # version instead of the other way round.
+      - numpy==1.26.4
 
   hygon:
     python: "3.10"
@@ -50,6 +70,7 @@ backends:
       - /opt/dtk-26.04/env.sh
     deps:
       - torch==2.9.0+das.opt1.dtk2604
+      - flash_attn==2.8.3+das.opt1.dtk2604.torch290
 
   iluvatar:
     python: "3.12"
@@ -63,6 +84,8 @@ backends:
       CPATH: /usr/local/cuda-10.2/include
     deps:
       - torch==2.10.0+corex.4.5.0.20260804
+      - torchaudio==2.10.0+corex.4.5.0.20260804
+      - torchvision==0.25.0+corex.4.5.0.20260804
       - numpy<2
 
   metax-maca3810:
@@ -71,10 +94,19 @@ backends:
     flagtree: flagtree==0.7.0+metax3.6
     env:
       MACA_PATH: /opt/maca
-      PATH: /opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
+      PATH: /opt/maca/mxgpu_llvm/bin:/opt/maca/bin:${PATH}
       LD_LIBRARY_PATH: /opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
     deps:
+      - apex==0.1+metax3.8.1.0
+      - flash_attn==2.6.3+metax3.8.1.0torch2.10
+      - flashinfer==0.2.6+metax3.8.1.0torch2.10
+      - flash_linear_attention==0.5.0+metax3.8.1.0torch2.10
+      - flash_mla==1.0.1+metax3.8.1.0torch2.10
+      - numpy==2.3.5
       - torch==2.10.0+metax3.8.1.0
+      - torchcodec==0.6.0+metax3.8.1.0
+      - torchaudio==2.4.1+metax3.8.1.0
+      - torchvision==0.25.0+metax3.8.1.0
 
   thead:
     python: "3.12"
