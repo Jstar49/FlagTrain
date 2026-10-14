@@ -154,8 +154,12 @@ def decide(
         return "false", "", "", ""
 
     # Touching the deepspeed __init__ (the public export surface) can change
-    # what any operator resolves to: treat it as touching every operator.
-    if init_changed:
+    # what any operator resolves to. An __init__-only edit (no operator file
+    # touched alongside) is ambiguous, so fail open and run everything. But the
+    # common case is the mandatory registration edit that accompanies adding an
+    # operator (new <op>.py + a from/__all__ line in __init__) — that change
+    # only introduces the new operator, so scope to the touched operators.
+    if init_changed and not ops:
         ops = set(op_ids)
 
     # No operator touched (infra-only, or an unrecognised path): fail open.

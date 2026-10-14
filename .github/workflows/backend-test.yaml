@@ -26,15 +26,25 @@
 #                 reference, a quick pass whose reference is the CPU
 #                 (--ref=cpu --quick), and the performance suites.
 #
-#   test-container the vendor runtime images already ship that vendor's torch
-#                 and triton, so the job is a `container:` job on the vendor's
-#                 runner and tools/setup_env.sh only adds FlagTrain and the test
-#                 dependencies. thead is the exception (prebuilt_env false):
-#                 its image is the vendor's own, and setup_env.sh installs the
-#                 vendor stack from backends.yaml first.
+#   test-container a vendor whose backend entry carries a container: block runs
+#                 in that image on the vendor's runner. The runtime images
+#                 already ship that vendor's torch and triton, so
+#                 tools/setup_env.sh only adds FlagTrain and the test
+#                 dependencies; thead is the exception (prebuilt_env false),
+#                 whose image is the vendor's own and gets the vendor stack
+#                 installed from backends.yaml first.
 #
-# Neither shape uses a secret: a fork's PR builds and tests exactly like a
-# branch here.
+#   test-native   a vendor with no container: block runs on the runner itself,
+#                 with tools/setup_env.sh --no-prebuilt building the python
+#                 stack into a job-local venv. ascend is here, like FlagGems'
+#                 ascend job: that runner's own process cannot reach
+#                 /var/run/docker.sock, so a container job never starts there.
+#
+# Which shape a backend gets is data, not a name check: a container: block in
+# .github/backends.json selects the container job, its absence the native one.
+#
+# No shape uses a secret: a fork's PR builds and tests exactly like a branch
+# here.
 
 name: backend-test
 
@@ -229,7 +239,7 @@ jobs:
           if-no-files-found: ignore
 
   test-container:
-    if: inputs.backend != 'nvidia-cuda133'
+    if: inputs.backend != 'nvidia-cuda133' && inputs.container_image != ''
     runs-on: ${{ inputs.runs_on }}
     container:
       image: ${{ inputs.container_image }}
@@ -294,6 +304,79 @@ jobs:
           # Results go to $RUNNER_TEMP, not the workspace: the container runs
           # as root and a reused self-hosted workspace must not collect
           # root-owned files.
+          results="${RUNNER_TEMP}/flagtrain-results"
+          mkdir -p "${results}"
+          pytest -v -p no:cacheprovider ${extra_opts} \
+            --record json --output "${results}/accuracy_result.json" \
+            ${test_targets}
+
+      - name: Upload the accuracy report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: accuracy-result-${{ inputs.backend }}
+          path: ${{ runner.temp }}/flagtrain-results/accuracy_result.json
+          if-no-files-found: ignore
+
+  test-native:
+    if: inputs.backend != 'nvidia-cuda133' && inputs.container_image == ''
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 180
+    concurrency:
+      group: op-test-${{ inputs.backend }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        continue-on-error: true
+
+      - uses: flagos-ai/FlagTrain/.github/actions/checkout-retry@main
+        with:
+          fetch-depth: "1"
+
+      - name: Create the test environment
+        shell: bash
+        run: |
+          # A native vendor runner is a bare machine, so the python stack is
+          # built here rather than coming from an image. The venv lives under
+          # $RUNNER_TEMP -- a reused workspace must stay clean -- and goes on
+          # $GITHUB_PATH so every later step uses it.
+          wanted=$(python3 -c "import yaml;print(yaml.safe_load(open('backends.yaml'))['backends']['${{ inputs.backend }}'].get('python',''))" 2>/dev/null || echo "")
+          python_bin="python3"
+          if [ -n "${wanted}" ] && command -v "python${wanted}" >/dev/null 2>&1; then
+            python_bin="python${wanted}"
+          fi
+          echo "backend wants python ${wanted:-<unspecified>}; using ${python_bin} ($(${python_bin} -V 2>&1))"
+          "${python_bin}" -m venv "${RUNNER_TEMP}/flagtrain-venv"
+          echo "${RUNNER_TEMP}/flagtrain-venv/bin" >> "${GITHUB_PATH}"
+          # pyyaml first: tools/setup_env.sh parses backends.yaml with it, so it
+          # must be importable before that script can install anything.
+          "${RUNNER_TEMP}/flagtrain-venv/bin/python" -m pip install --quiet --upgrade pip pyyaml
+
+      - name: Install the backend stack, FlagTrain and the test dependencies
+        shell: bash
+        run: bash tools/setup_env.sh "${{ inputs.backend }}" --no-prebuilt
+
+      - name: Check accelerator availability
+        if: inputs.gpu_check != ''
+        shell: bash
+        run: bash ${{ inputs.gpu_check }}
+
+      - name: Run the correctness suites
+        shell: bash
+        env:
+          TEST_TARGETS: ${{ inputs.test_targets }}
+        run: |
+          # Same shape as the container job: correctness against the device
+          # reference, scoped to the operators this PR touched.
+          if [ "${TEST_TARGETS}" = "__ALL__" ] || [ -z "${TEST_TARGETS}" ]; then
+            test_targets="tests/"
+            extra_opts=""
+          else
+            test_targets="${TEST_TARGETS}"
+            extra_opts="-x"
+          fi
+          echo "correctness targets: ${test_targets}"
+
           results="${RUNNER_TEMP}/flagtrain-results"
           mkdir -p "${results}"
           pytest -v -p no:cacheprovider ${extra_opts} \

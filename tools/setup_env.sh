@@ -57,6 +57,15 @@ usage() {
 BACKEND="${1:-}"
 [ -n "${BACKEND}" ] || usage
 
+# This script reads backends.yaml, so pyyaml must be importable by the python
+# that runs it. Say so plainly instead of dying in a traceback -- on a native
+# vendor runner the venv it installs into is created by the workflow, which
+# installs pyyaml for this reason.
+if ! python3 -c "import yaml" >/dev/null 2>&1; then
+    echo "tools/setup_env.sh: pyyaml is missing from $(command -v python3); install it first (pip install pyyaml)" >&2
+    exit 2
+fi
+
 PREBUILT=1
 case "${2:-}" in
     "" | --prebuilt) PREBUILT=1 ;;

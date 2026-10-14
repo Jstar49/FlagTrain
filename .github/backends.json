@@ -19,14 +19,9 @@
     "label": "vendor/Ascend",
     "gpu_check": "tools/gpu_check_ascend.sh",
     "label_gated": true,
-    "prebuilt_env": true,
-    "enabled": false,
-    "container": {
-      "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-ascend-cann9.0.0:2.2.0",
-      "options": "--device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 --device=/dev/davinci_manager --device=/dev/devmm_svm --device=/dev/hisi_hdc -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /usr/local/Ascend/driver:/usr/local/Ascend/driver -v /etc/ascend_install.info:/etc/ascend_install.info --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864",
-      "runs_on": "cann9"
-    },
-    "note": "FlagGems runs ascend natively on cann9; the device/mount set above is the standard Ascend container one and has NOT been tried here -- verify it on the runner when enabling, and fall back to FlagGems' native job (setup_env.sh in the job instead of a container) if the runner cannot start containers with NPUs."
+    "prebuilt_env": false,
+    "enabled": true,
+    "note": "Native, like FlagGems' ascend job: the cann9 runner's own process cannot reach /var/run/docker.sock, so a `container:` job never starts there (the runner fails at 'Checking docker version' before any step runs). No container block, so backend-test.yaml picks its native job, and setup_env.sh --no-prebuilt installs the CANN torch stack from backends.yaml into a job-local venv."
   },
   {
     "backend": "hygon",
