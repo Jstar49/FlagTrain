@@ -343,13 +343,13 @@ def _query_tile_cap(block_d, block_n):
 
 
 def blocked_flash(
-    out,
-    q,
-    k,
-    v,
-    attention_atoms,
-    kv_block_idx,
-    softmax_scale,
+    out=None,
+    q=None,
+    k=None,
+    v=None,
+    attention_atoms=None,
+    kv_block_idx=None,
+    softmax_scale=None,
     is_causal=True,
     q_block_size=None,
 ):
