@@ -182,6 +182,21 @@ if [ -n "${MIRROR}" ]; then
     pip_args+=(--extra-index-url "${MIRROR}")
 fi
 
+# setuptools>=77 is the repo's build requirement (PEP 639 metadata); install it
+# first so `--no-build-isolation` below has a backend to use.
+python3 -m pip install "${pip_args[@]}" --upgrade "setuptools>=77"
+python3 -m pip install "${pip_args[@]}" --no-build-isolation -e "${REPO_ROOT}"
+# The test dependencies. numpy is not decoration: tests/accuracy_utils.py
+# imports it, and so does torch_npu's profiler -- which torch 2.11 pulls in
+# through its device-backend autoload, so a venv without numpy fails at
+# `import torch` on ascend. Nothing in the vendor stack declares it (torch
+# treats numpy as optional), and the 3.11 venv a native runner builds starts
+# empty, which is how the first native ascend run died.
+python3 -m pip install "${pip_args[@]}" pytest pyyaml sqlalchemy packaging numpy
+
+# The vendor stack goes last, so a backend's own pins win over the shared list
+# above (iluvatar's `numpy<2`, for one). Skipped when the image already ships
+# the stack.
 if [ "${PREBUILT}" -eq 0 ]; then
     if [ -n "${COMPILER_PKG}" ]; then
         echo "installing ${BACKEND} compiler (${COMPILER_PKG})"
@@ -195,12 +210,6 @@ if [ "${PREBUILT}" -eq 0 ]; then
         python3 -m pip install "${pip_args[@]}" ${DEPS}
     fi
 fi
-
-# setuptools>=77 is the repo's build requirement (PEP 639 metadata); install it
-# first so `--no-build-isolation` below has a backend to use.
-python3 -m pip install "${pip_args[@]}" --upgrade "setuptools>=77"
-python3 -m pip install "${pip_args[@]}" --no-build-isolation -e "${REPO_ROOT}"
-python3 -m pip install "${pip_args[@]}" pytest pyyaml sqlalchemy packaging
 
 echo "checking that FlagTrain imports on this platform"
 python3 -c "import flag_train; print('flag_train:', flag_train.vendor_name, '/', flag_train.device)"

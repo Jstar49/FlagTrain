@@ -37,8 +37,22 @@ backends:
     env_source:
       - /usr/local/Ascend/cann/set_env.sh
     deps:
+      # FlagGems' cann900 list in full: the vendor wheels do not declare these
+      # themselves, but torch-npu imports decorator/attrs/psutil at run time
+      # and cann-shmem backs its shared-memory paths. Trimming the list to what
+      # the tests import is what left the first native ascend venv without the
+      # vendor's own runtime deps; the shared test dependencies (including
+      # numpy) are installed by tools/setup_env.sh on top of this.
       - torch==2.10.0+cpu
       - torch-npu==2.10.0
+      - cann-shmem==1.6.0
+      - decorator==5.1.1
+      - attrs==24.2.0
+      - psutil==6.0.0
+      # Same numpy the ascend runtime image ships (build-infra's pin). It is
+      # installed after the shared test dependencies, so it decides the final
+      # version instead of the other way round.
+      - numpy==1.26.4
 
   hygon:
     python: "3.10"
