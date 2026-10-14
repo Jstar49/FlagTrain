@@ -225,13 +225,19 @@ fi
 # first so `--no-build-isolation` below has a backend to use.
 python3 -m pip install "${pip_args[@]}" --upgrade "setuptools>=77"
 python3 -m pip install "${pip_args[@]}" --no-build-isolation -e "${REPO_ROOT}"
-# The test dependencies. numpy is not decoration: tests/accuracy_utils.py
-# imports it, and so does torch_npu's profiler -- which torch 2.11 pulls in
-# through its device-backend autoload, so a venv without numpy fails at
-# `import torch` on ascend. Nothing in the vendor stack declares it (torch
-# treats numpy as optional), and the 3.11 venv a native runner builds starts
-# empty, which is how the first native ascend run died.
-python3 -m pip install "${pip_args[@]}" pytest pyyaml sqlalchemy packaging numpy
+# The test dependencies, plus the packages a vendor stack uses without
+# declaring them -- the same set the FlagOS runtime images preinstall as their
+# runtime_prereqs (build-infra's configs.yaml), at the same versions:
+#   numpy     tests/accuracy_utils.py, and torch_npu's profiler, which torch
+#             2.11 pulls in through its device-backend autoload -- without it
+#             `import torch` fails.
+#   pybind11  imported at run time by triton/backends/ascend/utils.py, so
+#             `import triton` fails without it (flagtree's wheel does not
+#             declare it).
+#   ninja     triton JIT-builds its launcher with it.
+# A native runner's fresh venv has none of them; a prebuilt image does.
+python3 -m pip install "${pip_args[@]}" pytest pyyaml sqlalchemy packaging numpy \
+    pybind11==3.0.3 ninja==1.13.0
 
 # The vendor stack goes last, so a backend's own pins win over the shared list
 # above (iluvatar's `numpy<2`, for one). Skipped when the image already ships
