@@ -70,6 +70,7 @@ backends:
       - /opt/dtk-26.04/env.sh
     deps:
       - torch==2.9.0+das.opt1.dtk2604
+      - flash_attn==2.8.3+das.opt1.dtk2604.torch290
 
   iluvatar:
     python: "3.12"
@@ -83,6 +84,8 @@ backends:
       CPATH: /usr/local/cuda-10.2/include
     deps:
       - torch==2.10.0+corex.4.5.0.20260804
+      - torchaudio==2.10.0+corex.4.5.0.20260804
+      - torchvision==0.25.0+corex.4.5.0.20260804
       - numpy<2
 
   metax-maca3810:
@@ -91,10 +94,19 @@ backends:
     flagtree: flagtree==0.7.0+metax3.6
     env:
       MACA_PATH: /opt/maca
-      PATH: /opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
+      PATH: /opt/maca/mxgpu_llvm/bin:/opt/maca/bin:${PATH}
       LD_LIBRARY_PATH: /opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
     deps:
+      - apex==0.1+metax3.8.1.0
+      - flash_attn==2.6.3+metax3.8.1.0torch2.10
+      - flashinfer==0.2.6+metax3.8.1.0torch2.10
+      - flash_linear_attention==0.5.0+metax3.8.1.0torch2.10
+      - flash_mla==1.0.1+metax3.8.1.0torch2.10
+      - numpy==2.3.5
       - torch==2.10.0+metax3.8.1.0
+      - torchcodec==0.6.0+metax3.8.1.0
+      - torchaudio==2.4.1+metax3.8.1.0
+      - torchvision==0.25.0+metax3.8.1.0
 
   thead:
     python: "3.12"

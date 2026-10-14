@@ -273,6 +273,12 @@ jobs:
 
       - name: Install FlagTrain and the test dependencies
         run: |
+          # No venv is created here, and none should be: the job already runs
+          # inside the vendor image, whose own environment (the FlagOS images
+          # put a /flagos venv on PATH, with torch and triton in it) is what
+          # the tests must use. setup_env.sh installs into that interpreter
+          # with `python3 -m pip`, exactly as FlagGems' container jobs install
+          # into their image's python. Only the native job builds a venv.
           if [ "${{ inputs.prebuilt_env }}" = "true" ]; then
             bash tools/setup_env.sh "${{ inputs.backend }}" --prebuilt
           else
