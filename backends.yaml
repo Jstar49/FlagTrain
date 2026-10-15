@@ -28,6 +28,7 @@ backends:
       - torchvision==0.26.0+cu130
       - deepspeed==0.19.7
       - deepspeed-kernels==0.0.1
+      - nvidia-cutlass==3.8.0.0
 
   ascend-cann900:
     python: "3.11"

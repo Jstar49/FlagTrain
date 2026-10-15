@@ -133,6 +133,9 @@ ENV PIP_INDEX_URL=${PYPI_MIRROR} \
 # the image's compiler is the version the rest of this toolchain was verified
 # against. The probe prints both versions, so no future failure has to guess.
 # python3.12-venv: the base ships the interpreter, but neither venv nor pip.
+# libaio-dev / libcufile-dev: cuFile (GPUDirect Storage) dev headers and the
+# libaio async-I/O library cuFile links against. Not part of the pin loop above
+# because they are not on the DeepSpeed JIT link line that loop was built for.
 RUN set -eux; \
     apt-get update; \
     pins=""; \
@@ -156,7 +159,8 @@ RUN set -eux; \
         cuda-nvcc-13-3 \
         ${pins} \
         gcc-13 g++-13 \
-        python3.12-venv python3-pip; \
+        python3.12-venv python3-pip \
+        libaio-dev libcufile-dev; \
     nvcc --version; \
     apt-get clean; rm -rf /var/lib/apt/lists/*
 
