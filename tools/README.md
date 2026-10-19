@@ -55,15 +55,18 @@ CI 辅助脚本：在共享的 NVIDIA 机器上等一张空闲显卡。`.github/
 
 脚本内容与 FlagGems 的同名脚本一致，两边的 CI 行为保持对齐。
 
-## `gpu_check_{ascend,hygon,iluvatar,metax,thead}.sh`
+## `gpu_check_{ascend,hygon,iluvatar,metax,mthreads,thead}.sh`
 
-五个厂商版本的同一个检查：`.github/workflows/backend-test.yaml` 的容器作业在跑测试前调用，
+六个厂商版本的同一个检查：`.github/workflows/backend-test.yaml` 的容器作业在跑测试前调用，
 路径由 `.github/backends.json` 的 `gpu_check` 字段指定。
 
 * 用途/输入/输出：与 `gpu_check_nvidia.sh` 完全一致（空闲阈值 30000 MB、重试间隔 120 秒、
   最长等待 600 秒；打印各卡显存表与 `Available GPUs: ...`；无命令行参数）。区别只在查询工具:
-  ascend `npu-smi`、hygon `hy-smi`、iluvatar `ixsmi`、metax `mx-smi`、thead `ppu-smi`。
-* 依赖：对应的厂商 smi 工具；在容器内执行（作业本身就是容器）。
+  ascend `npu-smi`、hygon `hy-smi`、iluvatar `ixsmi`、metax `mx-smi`、mthreads `mthreads-gmi`、
+  thead `ppu-smi`。
+* 依赖：对应的厂商 smi 工具；在容器内执行（作业本身就是容器）。`gpu_check_mthreads.sh` 自己
+  导出 `MUSA_INSTALL_PATH`/`PATH`/`LD_LIBRARY_PATH`，且 `mthreads-gmi` 由 `.github/backends.json`
+  的 `container.options` 从宿主机只读挂载进容器（该镜像未确认自带）。
 * 实测预期：与前一个脚本相同（空闲时第一轮通过，被占满时每 120 秒重试、10 分钟后报
   `Timed out` 并失败）。阈值/等待策略未改动，脚本正文与 FlagGems 同名脚本逐字一致（可 diff 验证）。
 

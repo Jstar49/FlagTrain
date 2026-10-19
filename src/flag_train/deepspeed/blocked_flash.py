@@ -47,7 +47,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_train.runtime import torch_device_fn
+from flag_train.runtime import device, torch_device_fn
 from flag_train.utils import libentry
 
 logger = logging.getLogger(__name__)
@@ -336,12 +336,25 @@ def _blocked_flash_fwd_kernel(
     )
 
 
+# Vendors whose ``torch_device_fn`` answers with a *CUDA* compute capability.
+# The threshold below is written in sm_XX, so it is only a statement about a
+# device that reports in that scale. Every other vendor answers in its own:
+# MUSA reports its architecture generation -- which is why FlagGems' own
+# _mthreads backend gates its tensor-core ops on ``>= 3`` -- and reading a 3
+# as an sm_3x is how a port rejects a device that was fine.
+_CAPABILITY_VENDORS = {"nvidia"}
+
+
 def _device_capability():
     """``(major, minor)`` of the current device, or ``None`` if it will not say.
 
     ``None`` means "cannot tell", and the caller then leaves the device alone
-    rather than guessing a limit it did not state.
+    rather than guessing a limit it did not state. A vendor that reports in
+    another scale counts as "cannot tell" for the same reason -- the number is a
+    true answer to a different question, and the caller's limit is an sm_XX one.
     """
+    if device.vendor_name not in _CAPABILITY_VENDORS:
+        return None
     try:
         return torch_device_fn.get_device_capability(torch_device_fn.current_device())
     except Exception:

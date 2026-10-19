@@ -44,7 +44,7 @@
     "container": {
       "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-hygon-dtk26.04:2.2.0",
       "options": "--device /dev/kfd --device /dev/mkfd --device /dev/dri --group-add video --security-opt seccomp=unconfined --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864",
-      "runs_on": "hygon-bw1000-0"
+      "runs_on": "flagtrain-hygon-bw1000-0"
     }
   },
   {
@@ -62,7 +62,7 @@
     "container": {
       "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-iluvatar-corex4.5.0:2.2.0",
       "options": "--device /dev/iluvatar0 --device /dev/itrctl --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864",
-      "runs_on": "iluvatar-bi-v150-0"
+      "runs_on": "flagtrain-iluvatar-bi-v150-0"
     }
   },
   {
@@ -81,8 +81,27 @@
     "container": {
       "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-metax-maca3.8.1.3:2.2.0",
       "options": "--device /dev/mxcd --device /dev/dri --group-add video",
-      "runs_on": "metax-mxc550-0"
+      "runs_on": "flagtrain-metax-mxc550-0"
     }
+  },
+  {
+    "backend": "mthreads-musa520",
+    "vendor": "mthreads",
+    "runner_label": "musa-520",
+    "command_aliases": [
+      "mthreads"
+    ],
+    "label": "vendor/MooreThreads",
+    "gpu_check": "tools/gpu_check_mthreads.sh",
+    "label_gated": true,
+    "prebuilt_env": true,
+    "enabled": true,
+    "container": {
+      "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-mthreads-musa5.2.0:2.2.0",
+      "options": "--device /dev/mtgpu.0 --device /dev/mtgpu.1 --device /dev/mtgpu.2 --device /dev/mtgpu.3 --device /dev/mtgpu.4 --device /dev/mtgpu.5 --device /dev/mtgpu.6 --device /dev/mtgpu.7 --device /dev/dri --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864 -v /usr/bin/mthreads-gmi:/usr/bin/mthreads-gmi:ro",
+      "runs_on": "flagtrain-mthreads-s5000-0"
+    },
+    "note": "Container job on the FlagOS runtime image, like hygon/iluvatar/metax: it already ships torch + torch_musa + the MUSA flagtree, so setup_env.sh --prebuilt installs nothing but FlagTrain and the test deps. mthreads-gmi is bind-mounted read-only from the host because tools/gpu_check_mthreads.sh runs inside the container; drop the -v if the image turns out to carry it already (FlagGems passes the same mount, expressed as container.volumes, which this repo's schema does not have)."
   },
   {
     "backend": "thead",

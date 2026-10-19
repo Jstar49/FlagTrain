@@ -109,6 +109,24 @@ backends:
       - torchaudio==2.4.1+metax3.8.1.0
       - torchvision==0.25.0+metax3.8.1.0
 
+  mthreads-musa520:
+    python: "3.10"
+    cmake_backend: MUSA
+    triton: triton==3.6.0
+    flagtree: flagtree==0.7.0+mthreads3.6
+    env:
+      # MUSA_HOME is what the vendor toolchain and libmudnn are laid out under;
+      # the flagtree MUSA compiler reads the same tree. torch_musa is a separate
+      # distribution from torch and is what registers torch.musa, so both are
+      # pinned -- and it is torch_musa, not torch, that has to match the driver.
+      MUSA_HOME: /usr/local/musa
+      PATH: $MUSA_HOME/bin:$PATH
+      LD_LIBRARY_PATH: $VIRTUAL_ENV/lib:$MUSA_HOME/lib:$LD_LIBRARY_PATH
+    deps:
+      - torch==2.9.1+musa5.2.0
+      - torch_musa==2.9.1
+      - mkl==2024.0.0
+
   thead:
     python: "3.12"
     triton: triton==3.6.0+v0.2.0.ppu2.1.1
