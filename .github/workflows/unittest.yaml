@@ -19,17 +19,30 @@
 #
 #   1. what to run -- tools/ci_checks/select_changed_tests.py maps the PR's
 #      diff onto the operators it touches (`test_targets`), and answers
-#      `run_gpu` (false for a docs-only change);
+#      `run_gpu` (false for a docs-only change, and for a diff that maps to no
+#      concrete operator at all);
 #   2. where to run it -- .github/backends.json is the single source of truth
 #      for the platforms, and a backend is selected when
 #
-#        enabled && (!label_gated || the PR carries its `label`)
+#        run_gpu && enabled && (!label_gated || the PR carries its `label`)
+#        && (!tests_only || backend is nvidia)
 #
 #      so nvidia (label_gated false) runs on every PR that touches code, and
 #      each vendor runs only when triage has put its `vendor/*` label on the
 #      PR (see .github/labeler.yml). Every vendor entry ships `enabled: false`
 #      until its runner is registered; flipping that one field is all it takes
 #      to bring a platform online.
+#
+#      run_gpu false selects no backend at all -- infrastructure-only changes,
+#      docs, and the empty package scaffolding a new component starts with
+#      (nothing maps to an operator). That is the same "nothing to run"
+#      outcome FlagGems' test-op.sh has when it exits 0.
+#
+#      The one exception is `tests_only` (from select_changed_tests.py): when
+#      every non-doc changed file is a test file, only the nvidia backend runs
+#      -- a test edit exercises the generic operator, not a vendor kernel, so
+#      fanning it out across vendors (even when the PR carries their labels)
+#      adds no signal.
 #
 # The fields read from backends.json:
 #   backend, vendor, runner_label   identity and where the job is scheduled
@@ -145,10 +158,12 @@ jobs:
             const backends = JSON.parse(fs.readFileSync('.github/backends.json', 'utf8'));
             const labels = JSON.parse(${{ steps.get-labels.outputs.result }} || '[]');
             const runGpu = '${{ steps.select.outputs.run_gpu }}' === 'true';
+            const testsOnly = '${{ steps.select.outputs.tests_only }}' === 'true';
             const filtered = backends.filter(b =>
               b.enabled &&
-              (!b.label_gated || labels.includes(b.label)) &&
-              (b.backend !== 'nvidia-cuda133' || runGpu));
+              runGpu &&
+              (!testsOnly || b.backend === 'nvidia-cuda133') &&
+              (!b.label_gated || labels.includes(b.label)));
             const matrix = {
               backend: filtered.map(b => b.backend),
               include: filtered.map(b => ({

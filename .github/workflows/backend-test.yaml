@@ -32,13 +32,16 @@
 #                 tools/setup_env.sh only adds FlagTrain and the test
 #                 dependencies; thead is the exception (prebuilt_env false),
 #                 whose image is the vendor's own and gets the vendor stack
-#                 installed from backends.yaml first.
+#                 installed from backends.yaml first. Runs correctness, the
+#                 quick-CPU pass and the performance suites.
 #
 #   test-native   a vendor with no container: block runs on the runner itself,
 #                 with tools/setup_env.sh --no-prebuilt building the python
 #                 stack into a job-local venv. ascend is here, like FlagGems'
 #                 ascend job: that runner's own process cannot reach
 #                 /var/run/docker.sock, so a container job never starts there.
+#                 Runs correctness, the quick-CPU pass and the performance
+#                 suites.
 #
 # Which shape a backend gets is data, not a name check: a container: block in
 # .github/backends.json selects the container job, its absence the native one.
@@ -208,8 +211,10 @@ jobs:
 
           # Performance, FlagGems' mode: --level core --record log. Runs with
           # /out as the working dir so the log lands outside the workspace.
+          # A full run covers every component's benchmarks, like the
+          # correctness pass covering tests/ -- not just deepspeed's.
           if [ "${BENCH_TARGETS}" = "__ALL__" ]; then
-            bench_targets="benchmark/deepspeed/"
+            bench_targets="benchmark/"
           else
             bench_targets="${BENCH_TARGETS}"
           fi
@@ -217,8 +222,10 @@ jobs:
             bench_abs=""
             for b in ${bench_targets}; do bench_abs="${bench_abs} /work/${b}"; done
             echo "performance targets: ${bench_targets}"
+            # No -x here, unlike the correctness stages: FlagGems runs every
+            # selected benchmark and reports all of their failures together.
             docker run "${docker_opts[@]}" -w /out "${IMAGE}" \
-              pytest -v -p no:cacheprovider ${extra_opts} --level core \
+              pytest -v -p no:cacheprovider --level core \
                 --record log ${bench_abs} || failures=$((failures + 1))
           else
             echo "no performance targets for this change; skipping the performance suites"
@@ -294,10 +301,7 @@ jobs:
           TEST_TARGETS: ${{ inputs.test_targets }}
         run: |
           # Correctness against the device reference, scoped to the operators
-          # this PR touched. The nvidia job additionally runs the quick-CPU
-          # pass and the performance suites; add those stages here the same
-          # way (docker-free: pytest runs in the image already) once a vendor
-          # is online and its runtime is known.
+          # this PR touched.
           if [ "${TEST_TARGETS}" = "__ALL__" ] || [ -z "${TEST_TARGETS}" ]; then
             test_targets="tests/"
             extra_opts=""
@@ -315,6 +319,44 @@ jobs:
           pytest -v -p no:cacheprovider ${extra_opts} \
             --record json --output "${results}/accuracy_result.json" \
             ${test_targets}
+
+          # Second functional pass, FlagGems' quick-CPU mode: the reference
+          # runs on the CPU (--ref=cpu) with reduced shapes (--quick). Every
+          # backend runs it, as FlagGems' test-op.sh does.
+          echo "quick-cpu targets: ${test_targets} (--ref=cpu --quick)"
+          pytest -v -p no:cacheprovider ${extra_opts} \
+            ${test_targets} --ref=cpu --quick
+
+      - name: Run the performance suites
+        env:
+          BENCH_TARGETS: ${{ inputs.bench_targets }}
+        run: |
+          # Same scoping as the correctness step: the operators this PR
+          # touched, or every component's benchmarks on a full run. FlagGems'
+          # mode (--level core --record log), without -x: every selected
+          # benchmark runs so the log reports all of their failures.
+          if [ "${BENCH_TARGETS}" = "__ALL__" ]; then
+            bench_targets="benchmark/"
+          else
+            bench_targets="${BENCH_TARGETS}"
+          fi
+          if [ -z "${bench_targets}" ]; then
+            echo "no performance targets for this change; skipping the performance suites"
+            exit 0
+          fi
+
+          # Run from $RUNNER_TEMP: --record log writes result_*.log into the
+          # working directory, and the workspace must not collect root-owned
+          # files. The targets are made absolute because the working directory
+          # is no longer the repository root.
+          results="${RUNNER_TEMP}/flagtrain-results"
+          mkdir -p "${results}"
+          bench_abs=""
+          for b in ${bench_targets}; do bench_abs="${bench_abs} ${GITHUB_WORKSPACE}/${b}"; done
+          echo "performance targets: ${bench_targets}"
+          cd "${results}"
+          pytest -v -p no:cacheprovider --level core \
+            --record log ${bench_abs}
 
       - name: Upload the accuracy report
         if: always()
@@ -388,6 +430,41 @@ jobs:
           pytest -v -p no:cacheprovider ${extra_opts} \
             --record json --output "${results}/accuracy_result.json" \
             ${test_targets}
+
+          # Second functional pass, like the container job: the reference runs
+          # on the CPU (--ref=cpu) with reduced shapes (--quick).
+          echo "quick-cpu targets: ${test_targets} (--ref=cpu --quick)"
+          pytest -v -p no:cacheprovider ${extra_opts} \
+            ${test_targets} --ref=cpu --quick
+
+      - name: Run the performance suites
+        shell: bash
+        env:
+          BENCH_TARGETS: ${{ inputs.bench_targets }}
+        run: |
+          # Same shape as the container job: the operators this PR touched, or
+          # every component's benchmarks on a full run. No -x, matching
+          # FlagGems' benchmark loop.
+          if [ "${BENCH_TARGETS}" = "__ALL__" ]; then
+            bench_targets="benchmark/"
+          else
+            bench_targets="${BENCH_TARGETS}"
+          fi
+          if [ -z "${bench_targets}" ]; then
+            echo "no performance targets for this change; skipping the performance suites"
+            exit 0
+          fi
+
+          # --record log writes result_*.log into the working directory, so run
+          # from $RUNNER_TEMP and pass the targets absolutely.
+          results="${RUNNER_TEMP}/flagtrain-results"
+          mkdir -p "${results}"
+          bench_abs=""
+          for b in ${bench_targets}; do bench_abs="${bench_abs} ${GITHUB_WORKSPACE}/${b}"; done
+          echo "performance targets: ${bench_targets}"
+          cd "${results}"
+          pytest -v -p no:cacheprovider --level core \
+            --record log ${bench_abs}
 
       - name: Upload the accuracy report
         if: always()
