@@ -21,12 +21,14 @@ which is what ``SpecOpRegistrar`` registers.
 
 from .blocked_flash import blocked_flash
 from .evoformer_attn import evoformer_attn
+from .mixed_moe_gemm import mixed_moe_gemm
 from .packbits import packbits
 from .unpackbits import unpackbits
 
 __all__ = [
     "blocked_flash",
     "evoformer_attn",
+    "mixed_moe_gemm",
     "packbits",
     "unpackbits",
 ]
