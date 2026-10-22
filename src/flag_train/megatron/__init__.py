@@ -4,9 +4,11 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime.backend import SpecOpRegistrar
 
 from .fused_proj_rms_compute_h import fused_proj_rms_compute_h_fwd
+from .quick_gelu import quick_gelu
 
 __all__ = [
     "fused_proj_rms_compute_h_fwd",
+    "quick_gelu",
 ]
 
 
