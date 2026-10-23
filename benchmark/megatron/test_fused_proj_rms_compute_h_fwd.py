@@ -13,19 +13,21 @@
 # limitations under the License.
 """Performance of the fused mHC projection + RMS + compute_h forward.
 
-The baseline is Megatron's *unfused* torch composition (``native_proj_rms`` +
-``_compute_h`` without ``torch.compile``): a promoted-dtype matmul, a separate
-row norm, then the segment-wise scale/bias/activation. It returns the same five
-tensors as the operator, so both sides materialize the projection.
+The baseline is Megatron's own ``fused_proj_rms_compute_h`` forward from
+``megatron/core/fusions/fused_mhc_kernels.py``: the installed module when it
+ships the mHC kernels (which dispatches to its cuTile kernel when available),
+otherwise a verbatim copy of its torch path. It returns the public four
+outputs -- the reduced projection is internal -- so the untimed check compares
+those four.
 
 This benchmarks mHC's real configuration: low-precision activations with the
 mapping parameters kept in fp32 (``keep_in_fp32``), so ``promote_types`` makes
 the projection fp32.
 
-Precision caveat: the harness disables torch tf32, so the baseline's fp32
-matmul is IEEE, while the operator's fp32 dot is tf32 (matching Megatron's
-cuTile forward). The speedup therefore includes the precision difference
-between the two paths.
+Precision caveat: when the baseline takes Megatron's torch path, the harness
+has disabled torch tf32, so its fp32 matmul is IEEE while the operator's fp32
+dot is tf32; that speedup includes the precision difference. With Megatron's
+cuTile kernel available both sides use tf32.
 
 Run::
 
@@ -62,7 +64,7 @@ _WEIGHT_DTYPE = torch.float32
 _TOLERANCE = {torch.float16: 1e-3, torch.bfloat16: 2e-2}
 
 
-def torch_op(
+def _megatron_torch_forward(
     x,
     weight,
     alpha_pre,
@@ -72,44 +74,54 @@ def torch_op(
     n,
     eps=1e-6,
     compute_h_eps=1e-6,
+    *,
+    backend=None,
 ):
-    """Unfused torch reference: projection, RMS scale, and compute_h."""
-    compute_dtype = torch.promote_types(x.dtype, weight.dtype)
-    x = x.to(compute_dtype)
-    weight = weight.to(compute_dtype)
+    """Megatron's ``fused_proj_rms_compute_h`` torch path, copied verbatim.
+
+    Source: ``megatron/core/fusions/fused_mhc_kernels.py`` at Megatron-LM
+    ``6c8f14a3ecbd8ac4095c5d795f2661732381d702``, function
+    ``_torch_proj_rms_compute_h`` (the path the public function dispatches to
+    when cuTile is unavailable). ``backend`` mirrors the public signature; this
+    copy is the torch path, so it is accepted and ignored.
+
+    It returns the public four outputs: the reduced projection is internal.
+    """
+    # compute_mappings() hands us activations in the activation dtype while the
+    # mapping parameters are keep_in_fp32, so matmul would reject the pair.
+    # Compute in the wider of the two, matching the unfused path's fp32 upcast
+    # without letting a lower-precision parameter downcast the activations.
+    x = x.to(torch.promote_types(x.dtype, weight.dtype))
     proj = torch.matmul(x, weight.t())
     r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
-    N = weight.shape[0]
     alpha = torch.cat(
         [
             alpha_pre.expand(n),
             alpha_post.expand(n),
-            alpha_res.expand(N - 2 * n),
+            alpha_res.expand(weight.shape[0] - 2 * n),
         ],
         dim=-1,
     )
     h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
-    return (
-        h[..., :n].sigmoid() + compute_h_eps,
-        h[..., n : 2 * n].sigmoid() * 2,
-        h[..., 2 * n :],
-        r,
-        proj,
-    )
+    h_pre = h[..., :n].sigmoid() + compute_h_eps
+    h_post = h[..., n : 2 * n].sigmoid() * 2
+    h_res = h[..., 2 * n :]
+    return h_pre, h_post, h_res, r
 
 
-def base_op():
-    # Prefer the installed Megatron; fall back to the CPU fp64 oracle when the
-    # package (or this operator) is unavailable, so the test still runs.
+def _load_megatron_forward():
+    # Prefer the installed Megatron (which may dispatch to its cuTile kernel);
+    # the verbatim copy keeps the baseline aligned when the installed release
+    # predates the mHC kernels (megatron-core 0.19.2 does not ship this module).
     try:
         import megatron.core.fusions.fused_mhc_kernels as fused_mhc_kernels
 
         return fused_mhc_kernels.fused_proj_rms_compute_h
     except (ImportError, AttributeError):
-        return torch_op
+        return _megatron_torch_forward
 
 
-reference_fused_proj_rms_compute = base_op()
+torch_op = _load_megatron_forward()
 
 
 def _input_fn(shape, dtype, device):
@@ -125,12 +137,11 @@ def _input_fn(shape, dtype, device):
 
     # One untimed correctness check per shape so both sides answer the same
     # question (the operator's fp32 dot is tf32; see the module docstring).
-    expected = reference_fused_proj_rms_compute(*args)
+    # Megatron's forward returns four tensors; `proj` is our backward extra.
+    expected = torch_op(*args)
     got = flag_train.megatron.fused_proj_rms_compute_h_fwd(*args)
     tolerance = _TOLERANCE[dtype]
-    for name, result, ref in zip(
-        ("h_pre", "h_post", "h_res", "r", "proj"), got, expected
-    ):
+    for name, result, ref in zip(("h_pre", "h_post", "h_res", "r"), got[:4], expected):
         torch.testing.assert_close(
             result,
             ref,
@@ -178,7 +189,7 @@ def test_fused_proj_rms_compute_h_fwd_perf():
     bench = ProjRmsComputeHBenchmark(
         input_fn=_input_fn,
         op_name="fused_proj_rms_compute_h_fwd",
-        torch_op=reference_fused_proj_rms_compute,
+        torch_op=torch_op,
         dtypes=_ACTIVATION_DTYPES,
     )
     bench.set_train(flag_train.megatron.fused_proj_rms_compute_h_fwd)

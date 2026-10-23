@@ -30,21 +30,24 @@ For ``x`` of shape ``[M, K]``, ``weight`` of shape ``[N, K]`` with
 denominator. ``h_res`` is returned as raw logits: the caller applies the
 Sinkhorn-Knopp projection afterwards.
 
-The matmul is the only reduction over ``K``, so the kernel maps one program per
-``BLOCK_M`` rows of ``x`` and loops over ``K``. The projection tile stays in
-registers: it is scaled, biased, activated and scattered to the three segment
-outputs without a second pass over memory. The RMS square sum is accumulated in
-fp32 in the same loop, so ``x`` is read once for both outputs.
+The work is split into two streaming kernels. ``_rms_norm_kernel`` reduces the
+square sum over ``K`` and writes ``r``; ``_proj_compute_h_kernel`` runs the
+pipelined matmul and, with the whole projection tile in registers, scales,
+biases, activates and scatters it to the three segment outputs. That reads
+``x`` twice, but both loops run with software pipelining, which the fused
+single-kernel form cannot: Triton 3.6 miscompiles a pipelined loop whose tile
+feeds both ``tl.dot`` and a reduction (wrong, non-deterministic accumulator
+rows), and the unpipelined single-kernel loop measured slower than these two
+pipelined passes together on the H20 mHC shapes. The norm kernel keeps its
+per-``K``-tile squares in an fp32 tile accumulator and reduces once after the
+loop, so the pipelined loop contains no reduction.
 
 Precision: with fp32 operands ``tl.dot`` uses the backend's default input
 precision (tf32 on NVIDIA), which is what Megatron's cuTile forward uses
 (``tfloat32`` MMA); low-precision activations keep their own dtype for the dot
-and accumulate in fp32. The square sum is always fp32. The ``K`` loop opts out
-of Triton's software pipelining: with a pipelined loop the same ``x`` tile
-feeds both ``tl.dot`` and the reduction, and Triton 3.6 miscompiles that
-combination (wrong and non-deterministic accumulator rows), while the
-unpipelined loop is verified against the reference; reading ``x`` once still
-beats a separate RMS kernel that reads it twice.
+and accumulate in fp32. The square sum is always fp32. ``r`` is written in the
+promoted matmul dtype (the reference's dtype) and read back by the epilogue
+kernel, so a low-precision path uses the same rounded ``r`` as the reference.
 
 The reduced projection is returned as well (as Megatron's cuTile forward does)
 because the backward consumes it.
@@ -65,8 +68,19 @@ logger = logging.getLogger(__name__)
 _NUM_WARPS = 4
 _NUM_STAGES = 3
 
-_BLOCK_M = 32
-_BLOCK_K = 256
+# RMS kernel: one program covers a small row block and the full K axis.
+_NORM_BLOCK_M = 32
+_NORM_BLOCK_K = 256
+
+# Projection kernel: at least 4096 rows fill the GPU well enough for 64-row
+# tiles (better weight reuse); below that the extra parallelism of 32-row tiles
+# wins. The tile sizes were measured on the H20 mHC shapes.
+_PROJ_LARGE_M = 4096
+_PROJ_BLOCK_M_LARGE = 64
+_PROJ_BLOCK_K_LARGE = 128
+_PROJ_BLOCK_M_SMALL = 32
+_PROJ_BLOCK_K_SMALL = 256
+
 _MIN_BLOCK_N = 16
 
 _FWD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -104,17 +118,58 @@ def _check_scalar(tensor, name, dtypes):
 
 @libentry()
 @triton.jit
-def _fused_proj_rms_compute_h_fwd_kernel(
+def _rms_norm_kernel(
+    x_ptr,
+    r_ptr,
+    M,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    STAGES: tl.constexpr,
+):
+    """``r = ||x|| / sqrt(K)`` for BLOCK_M rows, pipelined over K.
+
+    The per-tile squares accumulate in an fp32 ``[BLOCK_M, BLOCK_K]`` tile and
+    are reduced once after the loop. A reduction inside the loop is what
+    Triton 3.6 miscompiles when the same tile also feeds ``tl.dot``; keeping the
+    loop reduction-free lets it pipeline (it reaches HBM bandwidth here).
+    """
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < M
+    ks = tl.arange(0, BLOCK_K)
+    # Row offsets scale by K (up to M*K elements), which can exceed int32.
+    x_rows = x_ptr + rows.to(tl.int64)[:, None] * K
+
+    sq = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for k0 in tl.range(0, K, BLOCK_K, num_stages=STAGES):
+        ks_mask = k0 + ks < K
+        x_tile = tl.load(
+            x_rows + (k0 + ks)[None, :],
+            mask=row_mask[:, None] & ks_mask[None, :],
+            other=0.0,
+        )
+        # Squaring in bf16/fp16 loses most of the RMS scale's precision.
+        x_fp32 = x_tile.to(tl.float32)
+        sq += x_fp32 * x_fp32
+
+    r = tl.sqrt(tl.sum(sq, axis=1) / K.to(tl.float32))
+    tl.store(r_ptr + rows, r, mask=row_mask)
+
+
+@libentry()
+@triton.jit
+def _proj_compute_h_kernel(
     x_ptr,
     weight_ptr,
     alpha_pre_ptr,
     alpha_post_ptr,
     alpha_res_ptr,
     bias_ptr,
+    r_ptr,
     h_pre_ptr,
     h_post_ptr,
     h_res_ptr,
-    r_ptr,
     proj_ptr,
     M,
     K,
@@ -127,12 +182,14 @@ def _fused_proj_rms_compute_h_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    STAGES: tl.constexpr,
 ):
-    """One program covers BLOCK_M rows and reduces the full K axis.
+    """Projection, scale by ``r``, and the three compute_h segment outputs.
 
     ``BLOCK_N`` is ``N`` rounded up to a power of two, so one tile covers the
     whole weight row count and the segment layout (pre / post / res) is a
-    column mask rather than a loop.
+    column mask rather than a loop. The projection tile stays in registers
+    through the epilogue.
     """
     pid = tl.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -140,7 +197,6 @@ def _fused_proj_rms_compute_h_fwd_kernel(
     cols = tl.arange(0, BLOCK_N)
     col_mask = cols < N
     ks = tl.arange(0, BLOCK_K)
-    # Row offsets scale by K (up to M*K elements), which can exceed int32.
     rows64 = rows.to(tl.int64)
 
     # Scalar gating factors; the segment each one applies to is a column mask.
@@ -151,15 +207,9 @@ def _fused_proj_rms_compute_h_fwd_kernel(
     bias_tile = tl.load(bias_ptr + cols, mask=col_mask, other=0.0).to(tl.float32)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
-
     x_rows = x_ptr + rows64[:, None] * K
     weight_rows = weight_ptr + cols[None, :] * K
-    # num_stages=1 is deliberate: a pipelined loop that uses one x tile for both
-    # tl.dot and the square-sum reduction is miscompiled by Triton 3.6 (wrong,
-    # non-deterministic accumulator rows). Correctness first; the single read of
-    # x still beats splitting the RMS into a second kernel.
-    for k0 in tl.range(0, K, BLOCK_K, num_stages=1):
+    for k0 in tl.range(0, K, BLOCK_K, num_stages=STAGES):
         ks_mask = k0 + ks < K
         x_tile = tl.load(
             x_rows + (k0 + ks)[None, :],
@@ -171,18 +221,14 @@ def _fused_proj_rms_compute_h_fwd_kernel(
             mask=ks_mask[:, None] & col_mask[None, :],
             other=0.0,
         )
-        # The square sum is fp32 even for a low-precision activation dtype:
-        # squaring in bf16/fp16 loses most of the RMS scale's precision.
-        x_fp32 = x_tile.to(tl.float32)
-        sum_sq += tl.sum(x_fp32 * x_fp32, axis=1)
         if FP32_INPUT:
             # Backend-default precision (tf32 on NVIDIA), matching the tf32 MMA
             # of Megatron's cuTile forward; fp32 IEEE dot is ~10x slower here.
-            acc = tl.dot(x_fp32, weight_tile.to(tl.float32), acc=acc)
+            acc = tl.dot(x_tile.to(tl.float32), weight_tile.to(tl.float32), acc=acc)
         else:
             acc = tl.dot(x_tile, weight_tile, acc=acc)
 
-    r = tl.sqrt(sum_sq / K.to(tl.float32))
+    r = tl.load(r_ptr + rows, mask=row_mask, other=1.0).to(tl.float32)
     inv_r_eps = 1.0 / (r + eps)
     h = acc * (alpha[None, :] * inv_r_eps[:, None]) + bias_tile[None, :]
     sigmoid = tl.sigmoid(h)
@@ -208,8 +254,6 @@ def _fused_proj_rms_compute_h_fwd_kernel(
         mask=res_mask,
     )
 
-    tl.store(r_ptr + rows, r, mask=row_mask)
-
     tl.store(
         proj_ptr + rows64[:, None] * N + cols[None, :],
         acc,
@@ -217,11 +261,20 @@ def _fused_proj_rms_compute_h_fwd_kernel(
     )
 
 
-def _fwd_config(M, N, K):
-    """Tile sizes for one launch; tl.dot needs every axis to be at least 16."""
+def _norm_config(K):
+    """Tile sizes for the RMS kernel."""
+    block_k = max(16, min(_NORM_BLOCK_K, triton.next_power_of_2(max(K, 1))))
+    return _NORM_BLOCK_M, block_k
+
+
+def _proj_config(M, N, K):
+    """Tile sizes for the projection kernel; tl.dot needs axes of at least 16."""
     block_n = max(_MIN_BLOCK_N, triton.next_power_of_2(N))
-    block_m = min(_BLOCK_M, max(16, triton.next_power_of_2(max(M, 1))))
-    block_k = max(16, min(_BLOCK_K, triton.next_power_of_2(max(K, 1))))
+    if M >= _PROJ_LARGE_M:
+        block_m, block_k = _PROJ_BLOCK_M_LARGE, _PROJ_BLOCK_K_LARGE
+    else:
+        block_m, block_k = _PROJ_BLOCK_M_SMALL, _PROJ_BLOCK_K_SMALL
+    block_k = max(16, min(block_k, triton.next_power_of_2(max(K, 1))))
     return block_m, block_n, block_k
 
 
@@ -313,21 +366,32 @@ def fused_proj_rms_compute_h_fwd(
         # No launch when there are no rows to map.
         return h_pre, h_post, h_res, r, proj
 
-    block_m, block_n, block_k = _fwd_config(M, N, K)
-    grid = (triton.cdiv(M, block_m),)
+    norm_m, norm_k = _norm_config(K)
+    block_m, block_n, block_k = _proj_config(M, N, K)
 
     with torch_device_fn.device(device):
-        _fused_proj_rms_compute_h_fwd_kernel[grid](
+        _rms_norm_kernel[(triton.cdiv(M, norm_m),)](
+            x,
+            r,
+            M,
+            K,
+            BLOCK_M=norm_m,
+            BLOCK_K=norm_k,
+            STAGES=_NUM_STAGES,
+            num_warps=_NUM_WARPS,
+            num_stages=_NUM_STAGES,
+        )
+        _proj_compute_h_kernel[(triton.cdiv(M, block_m),)](
             x,
             weight,
             alpha_pre,
             alpha_post,
             alpha_res,
             bias,
+            r,
             h_pre,
             h_post,
             h_res,
-            r,
             proj,
             M,
             K,
@@ -340,6 +404,7 @@ def fused_proj_rms_compute_h_fwd(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
+            STAGES=_NUM_STAGES,
             num_warps=_NUM_WARPS,
             num_stages=_NUM_STAGES,
         )

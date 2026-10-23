@@ -13,9 +13,14 @@
 # limitations under the License.
 """Forward of Megatron's fused projection + RMS + compute_h mHC mapping.
 
-The oracle is Megatron's ``_torch_proj_rms_compute_h`` evaluated on the CPU in
-float64, independent of the Triton kernel. Inputs use Megatron's small uniform
-range so bf16/fp16 magnitudes stay well-conditioned.
+The reference is Megatron's own ``fused_proj_rms_compute_h`` forward from
+``megatron/core/fusions/fused_mhc_kernels.py``: the installed module when it
+ships the mHC kernels, otherwise a verbatim copy of its torch path. It returns
+four outputs; the operator's extra ``proj`` (kept for the backward) is not part
+of the upstream contract and is not compared. Under ``--ref cpu`` the same
+reference runs on the CPU with float64 inputs, so that pass compares against a
+higher-precision oracle. Inputs use Megatron's small uniform range so bf16/fp16
+magnitudes stay well-conditioned.
 
 Run with::
 
@@ -43,51 +48,89 @@ _CASES = [
     (256, 2, 512),
 ]
 
-# fp32 inputs use the backend's default dot precision (tf32 on NVIDIA, as
-# Megatron's cuTile forward does), so they agree with an IEEE-fp32/fp64
-# reference only to tf32 accuracy: ~1e-3 relative, three orders above the shared
-# fp32 rtol (1.3e-6). fp16/bf16 need no override -- their shared tolerances
-# (1e-3 / 0.016) already cover the dot's own rounding.
-_FP32_ATOL = 2e-3
+# Explicit absolute tolerances for two measured effects:
+#   fp32: the dot uses the backend's default precision (tf32 on NVIDIA, as
+#   Megatron's cuTile forward does), so it agrees with the baseline's IEEE fp32
+#   torch path only to tf32 accuracy (~1e-3 relative, three orders above the
+#   shared fp32 rtol of 1.3e-6).
+#   fp16/bf16: the baseline rounds *every* elementwise step of compute_h to the
+#   activation dtype, while the kernel keeps the epilogue in fp32 and rounds
+#   once at the store. Near-zero outputs (cancellation between the scaled
+#   projection and the bias) therefore differ by more than the shared 1e-4
+#   atol; the dtype rtol (1e-3 / 0.016) still covers the large values.
+_ATOL = {torch.float32: 2e-3, torch.float16: 1e-3, torch.bfloat16: 2e-3}
 
 
-def _reference(x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, cheps):
-    """Megatron ``_torch_proj_rms_compute_h`` on CPU in float64."""
-    x = x.cpu().double()
-    weight = weight.cpu().double()
+def _megatron_torch_forward(
+    x,
+    weight,
+    alpha_pre,
+    alpha_post,
+    alpha_res,
+    bias,
+    n,
+    eps=1e-6,
+    compute_h_eps=1e-6,
+    *,
+    backend=None,
+):
+    """Megatron's ``fused_proj_rms_compute_h`` torch path, copied verbatim.
+
+    Source: ``megatron/core/fusions/fused_mhc_kernels.py`` at Megatron-LM
+    ``6c8f14a3ecbd8ac4095c5d795f2661732381d702``, function
+    ``_torch_proj_rms_compute_h`` (the path the public function dispatches to
+    when cuTile is unavailable). ``backend`` mirrors the public signature; this
+    copy is the torch path, so it is accepted and ignored.
+
+    It returns the public four outputs: the reduced projection is internal to
+    the implementation.
+    """
+    # compute_mappings() hands us activations in the activation dtype while the
+    # mapping parameters are keep_in_fp32, so matmul would reject the pair.
+    # Compute in the wider of the two, matching the unfused path's fp32 upcast
+    # without letting a lower-precision parameter downcast the activations.
+    x = x.to(torch.promote_types(x.dtype, weight.dtype))
     proj = torch.matmul(x, weight.t())
     r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
-    N = weight.shape[0]
     alpha = torch.cat(
         [
-            alpha_pre.cpu().double().expand(n),
-            alpha_post.cpu().double().expand(n),
-            alpha_res.cpu().double().expand(N - 2 * n),
+            alpha_pre.expand(n),
+            alpha_post.expand(n),
+            alpha_res.expand(weight.shape[0] - 2 * n),
         ],
         dim=-1,
     )
-    h = proj * alpha.unsqueeze(0) / (r + eps) + bias.cpu().double().unsqueeze(0)
-    return (
-        h[..., :n].sigmoid() + cheps,
-        h[..., n : 2 * n].sigmoid() * 2,
-        h[..., 2 * n :],
-        r,
-        proj,
-    )
+    h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
+    h_pre = h[..., :n].sigmoid() + compute_h_eps
+    h_post = h[..., n : 2 * n].sigmoid() * 2
+    h_res = h[..., 2 * n :]
+    return h_pre, h_post, h_res, r
 
 
 def base_op():
-    # Prefer the installed Megatron; fall back to the CPU fp64 oracle when the
-    # package (or this operator) is unavailable, so the test still runs.
+    # Prefer the installed Megatron (which may dispatch to its cuTile kernel);
+    # the verbatim copy keeps the baseline aligned when the installed release
+    # predates the mHC kernels (megatron-core 0.19.2 does not ship this module).
     try:
         import megatron.core.fusions.fused_mhc_kernels as fused_mhc_kernels
 
         return fused_mhc_kernels.fused_proj_rms_compute_h
     except (ImportError, AttributeError):
-        return _reference
+        return _megatron_torch_forward
 
 
 reference_fused_proj_rms_compute = base_op()
+
+
+def _reference(*args):
+    """Call the Megatron reference; ``--ref cpu`` uses CPU float64 inputs."""
+    if utils.TO_CPU:
+        args = tuple(
+            arg.cpu().double() if isinstance(arg, torch.Tensor) else arg for arg in args
+        )
+        # The CPU oracle must take Megatron's torch path, not a device kernel.
+        return reference_fused_proj_rms_compute(*args, backend="native")
+    return reference_fused_proj_rms_compute(*args)
 
 
 def _inputs(M, n, K, x_dtype, weight_dtype, aux_dtype=torch.float32, seed=0):
@@ -109,10 +152,7 @@ def _check(got, expected, dtype):
     expected = expected.to(dtype)
     if not utils.TO_CPU:
         expected = expected.to(got.device)
-    if dtype == torch.float32:
-        utils.train_assert_close(got, expected, dtype, atol=_FP32_ATOL)
-    else:
-        utils.train_assert_close(got, expected, dtype)
+    utils.train_assert_close(got, expected, dtype, atol=_ATOL[dtype])
 
 
 @pytest.mark.fused_proj_rms_compute_h_fwd
@@ -127,13 +167,14 @@ def test_fwd_vs_reference(M, n, K, dtype):
     x, weight, alpha_pre, alpha_post, alpha_res, bias = _inputs(
         M, n, K, dtype, dtype, aux_dtype=dtype
     )
-    expected = reference_fused_proj_rms_compute(
+    expected = _reference(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, n, 1e-6, 1e-6
     )
     got = flag_train.megatron.fused_proj_rms_compute_h_fwd(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, n
     )
-    for result, ref in zip(got, expected):
+    # Megatron's forward returns four tensors; `proj` is our backward extra.
+    for result, ref in zip(got[:4], expected):
         _check(result, ref, dtype)
 
 
@@ -145,14 +186,15 @@ def test_fwd_activation_dtype_with_fp32_weight(M, n, K):
     x, weight, alpha_pre, alpha_post, alpha_res, bias = _inputs(
         M, n, K, x_dtype, torch.float32
     )
-    expected = reference_fused_proj_rms_compute(
+    expected = _reference(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, n, 1e-6, 1e-6
     )
     got = flag_train.megatron.fused_proj_rms_compute_h_fwd(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, n
     )
     # promote_types(activation, fp32) makes every output fp32.
-    for result, ref in zip(got, expected):
+    # Megatron's forward returns four tensors; `proj` is our backward extra.
+    for result, ref in zip(got[:4], expected):
         _check(result, ref, torch.float32)
 
 
@@ -163,13 +205,14 @@ def test_fwd_eps_arguments():
         64, 4, 512, torch.float32, torch.float32
     )
     eps, compute_h_eps = 1e-3, 1e-2
-    expected = reference_fused_proj_rms_compute(
+    expected = _reference(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, 4, eps, compute_h_eps
     )
     got = flag_train.megatron.fused_proj_rms_compute_h_fwd(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, 4, eps, compute_h_eps
     )
-    for result, ref in zip(got, expected):
+    # Megatron's forward returns four tensors; `proj` is our backward extra.
+    for result, ref in zip(got[:4], expected):
         _check(result, ref, torch.float32)
 
 
