@@ -1,0 +1,531 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Correctness tests for the WF6-AF16 linear operator.
+
+Two oracles, because they fail differently:
+
+* ``wf6af16_ref`` -- a plain-torch composition of the same contract (unpack
+  the codes, dequantize through the FP6-E3M2 value table, matmul in fp32). It
+  is the primary check and runs on any device, so the operator is testable
+  off NVIDIA.
+* DeepSpeed's ``cuda_wf6af16_linear`` -- the operator this implementation
+  ports. It is an independent implementation and its version is recorded in
+  ``_DEEPSPEED_VERSION``, as tests/deepspeed/README.md asks for, but it needs
+  the ``deepspeed`` package with its InferenceCore CUDA extension, and on a
+  backend in ``_DEEPSPEED_BASELINE_VENDORS`` below it is *required* -- if it
+  will not load there the module raises rather than losing the check quietly.
+  On other backends it is an additional check that is skipped.
+
+Checking both is not redundant: ``wf6af16_ref`` is the same arithmetic written
+from the same reading of the kernel, so a shared misreading of the contract
+would survive it. DeepSpeed's operator is the only oracle that can disagree
+with that reading. Note the packed byte layouts differ (DeepSpeed interleaves
+bits across threads for its MMA pipeline, FlagTrain packs densely row-major),
+so the comparison feeds both sides the *same* FP6 codes, packed by each
+side's own packer.
+"""
+
+import sys
+
+import pytest
+import torch
+import triton
+
+import flag_train
+
+from .. import accuracy_utils as utils
+
+# ---------------------------------------------------------------------------
+# Input preparation helpers (torch is fine here: this is test code, not the
+# library's host path).
+#
+# ``pack_weights_fp6`` produces the dense row-major byte layout the kernel
+# documents in its module docstring; ``quantize_weights_fp6`` is a plain-torch
+# stand-in for DeepSpeed's qtorch-based ``fp_quantize``, rounding to the
+# nearest representable FP6-E3M2 value with one scale per row.
+# ---------------------------------------------------------------------------
+
+# FP6-E3M2, exponent bias 3, exponent 7 is a normal value (no inf/NaN), so the
+# largest magnitude is 2^4 * 1.75 = 28 and the smallest non-zero one is 2^-4.
+_FP6_ABS_MAX = 28.0
+
+
+def _fp6_e3m2_table(device=None):
+    """All 64 values representable in FP6-E3M2, indexed by the 6-bit code.
+
+    Built on the CPU: it is only 64 exact values, and some device stacks
+    (Iluvatar's ixrtc) fail to JIT-compile torch's fp32 ``exp2`` kernel.
+    """
+    codes = torch.arange(64, dtype=torch.int32)
+    sign = torch.where((codes >> 5) & 1 == 1, -1.0, 1.0)
+    e = ((codes >> 2) & 7).to(torch.float32)
+    m = (codes & 3).to(torch.float32)
+    mag = torch.where(
+        (codes >> 2) & 7 == 0,
+        m * 0.0625,
+        torch.exp2(e - 3.0) * (1.0 + m * 0.25),
+    )
+    return (sign * mag).to(device)
+
+
+def quantize_weights_fp6(weight):
+    """Quantize a 2D weight matrix to FP6-E3M2 codes with per-row scales."""
+    assert weight.dim() == 2, "weight must be 2-dimensional"
+    weight = weight.to(torch.float32)
+
+    amax = weight.abs().amax(dim=1)
+    scales = amax / _FP6_ABS_MAX
+    # A zero row has nothing to quantize; give it scale 1 so the codes stay 0.
+    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+    scaled = weight / scales[:, None]
+
+    # Nearest-value lookup against the positive half of the code table.
+    table = _fp6_e3m2_table(device=weight.device)
+    positive = table[:32]  # codes 0..31 are the non-negative values
+    idx = torch.searchsorted(positive, scaled.abs().contiguous())
+    idx = idx.clamp(max=31)
+    lower = positive[(idx - 1).clamp(min=0)]
+    upper = positive[idx]
+    idx = torch.where(scaled.abs() - lower <= upper - scaled.abs(), idx - 1, idx)
+    idx = idx.clamp(min=0)
+    codes = torch.where(scaled < 0, idx | 0x20, idx)
+
+    return codes.to(torch.uint8), scales.to(torch.float16)
+
+
+def pack_weights_fp6(codes):
+    """Pack FP6 codes into the 2-bit and 4-bit slices the kernel consumes."""
+    assert codes.dim() == 2, "codes must be 2-dimensional"
+    out_channels, in_channels = codes.shape
+    assert in_channels % 4 == 0, "in_channels must be a multiple of 4"
+    assert codes.dtype == torch.uint8
+    assert int(codes.max()) < 64, "codes must be 6-bit values"
+
+    top2 = codes >> 4
+    low4 = codes & 0xF
+
+    t = top2.reshape(out_channels, in_channels // 4, 4).to(torch.uint8)
+    weights_2bit = (t[..., 0] << 6) | (t[..., 1] << 4) | (t[..., 2] << 2) | t[..., 3]
+
+    low = low4.reshape(out_channels, in_channels // 2, 2)
+    weights_4bit = (low[..., 0] << 4) | low[..., 1]
+
+    return weights_2bit.contiguous(), weights_4bit.contiguous()
+
+
+# ---------------------------------------------------------------------------
+# Reference implementation
+# ---------------------------------------------------------------------------
+
+
+def unpack_weights_fp6(weights_2bit, weights_4bit):
+    """Inverse of ``pack_weights_fp6``, composed from plain torch ops."""
+    out_channels, packed_k = weights_2bit.shape
+    in_channels = packed_k * 4
+
+    b2 = weights_2bit.to(torch.int32)
+    top2 = torch.stack([(b2 >> s) & 0x3 for s in (6, 4, 2, 0)], dim=-1)
+    top2 = top2.reshape(out_channels, in_channels)
+
+    b4 = weights_4bit.to(torch.int32)
+    low4 = torch.stack([(b4 >> s) & 0xF for s in (4, 0)], dim=-1)
+    low4 = low4.reshape(out_channels, in_channels)
+
+    return ((top2 << 4) | low4).to(torch.uint8)
+
+
+def wf6af16_ref(hidden_states, weights_2bit, weights_4bit, scales):
+    """Reference for the operator, composed from plain torch ops.
+
+    Mirrors the kernel's arithmetic: FP6 values are exact in fp16, the scale
+    multiply rounds to fp16 once (as the CUDA kernel's __hmul chain does), and
+    the matmul accumulates in fp32.
+    """
+    codes = unpack_weights_fp6(weights_2bit, weights_4bit)
+    table = _fp6_e3m2_table(device=codes.device)
+    w = (table[codes.long()].to(torch.float16) * scales[:, None]).to(torch.float32)
+    return (hidden_states.to(torch.float32) @ w.T).to(torch.float16)
+
+
+_DEEPSPEED_UNAVAILABLE_MSG = (
+    "DeepSpeed's cuda_wf6af16_linear reference is unavailable; install the "
+    "deepspeed package on a CUDA host to run this check."
+)
+_DEEPSPEED_AMPERE_ONLY_MSG = (
+    "DeepSpeed's cuda_wf6af16_linear is Ampere-only (kernel_matmul.cuh asserts "
+    "__CUDA_ARCH__ == 800); this device's compute capability is not sm_80, so "
+    "the reference cannot execute here."
+)
+_DEEPSPEED_HYGON_MSG = (
+    "DeepSpeed's cuda_wf6af16_linear cannot run on Hygon: kernel_matmul.cuh "
+    "guards the kernel body with __CUDA_ARCH__ in [800, 900), which no HIP "
+    "build satisfies, so the DCU build compiles to a stub that returns "
+    "garbage or fails outright."
+)
+
+
+# Backends whose reference is DeepSpeed. cuda_wf6af16_linear ships in the
+# InferenceCore CUDA extension, so only a backend that can compile and execute
+# one can host it. On these the reference is not optional -- a missing one is
+# an environment fault, and skipping quietly would thin the suite without
+# saying so. Hygon is deliberately absent: the extension builds through HIP
+# there, but the kernel is Ampere-locked (see _DEEPSPEED_HYGON_MSG), so the
+# torch composition is the only reference a DCU can run.
+_DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
+
+
+def _load_deepspeed_wf6af16():
+    """``(op, version)`` for DeepSpeed's cuda_wf6af16_linear, or ``(None, None)``.
+
+    ``InferenceCoreBuilder`` JIT-compiles the CUDA source shipped inside the
+    ``deepspeed`` package, then reuses the build cached under
+    ``torch_extensions``. The returned callable takes
+    ``(hidden_states, codes, scales)`` and returns the fp16 output, matching
+    ``wf6af16_ref``'s signature so tests can swap oracles freely.
+    """
+    if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
+        return None, None
+
+    # The CUDA kernel asserts __CUDA_ARCH__ == 800 at runtime, so on any other
+    # architecture it cannot serve as an oracle no matter how well it builds.
+    if flag_train.vendor_name == "nvidia":
+        capability = torch.cuda.get_device_capability()
+        if capability != (8, 0):
+            return None, None
+
+    try:
+        import deepspeed
+        from deepspeed.ops.op_builder import InferenceCoreBuilder
+
+        inf_module = InferenceCoreBuilder().load()
+        inf_module.create_handle()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{flag_train.vendor_name!r} must use DeepSpeed's "
+            f"cuda_wf6af16_linear as its reference, but it could not be "
+            f"loaded: {exc!r}. Build deepspeed, or drop the backend from "
+            f"_DEEPSPEED_BASELINE_VENDORS."
+        ) from exc
+
+    def deepspeed_wf6af16(hidden_states, weights_2bit, weights_4bit, scales):
+        out_channels = scales.shape[0]
+        tokens, in_channels = hidden_states.shape
+
+        # DeepSpeed's preprocess_weight wants the fake-quantized fp16 weights
+        # on CPU and re-packs them into its own interleaved layout. Feeding it
+        # the exact FP6 values from the table keeps that cast lossless.
+        codes = unpack_weights_fp6(weights_2bit.cpu(), weights_4bit.cpu())
+        table = _fp6_e3m2_table()
+        fake_fp16 = table[codes.long()].to(torch.float16)
+        ds_w2, ds_w4 = inf_module.preprocess_weight(fake_fp16)
+
+        device = hidden_states.device
+        output = torch.empty((tokens, out_channels), dtype=torch.float16, device=device)
+        # DeepSpeed picks split-K from a profiled map; 1 is always valid and
+        # keeps the oracle on the simplest code path.
+        workspace = torch.empty(
+            (1, out_channels, tokens), dtype=torch.float32, device=device
+        )
+        inf_module.cuda_wf6af16_linear(
+            output,
+            hidden_states,
+            ds_w2.to(device),
+            ds_w4.to(device),
+            scales.to(device),
+            workspace,
+            out_channels,
+            tokens,
+            in_channels,
+            1,
+        )
+        return output
+
+    return deepspeed_wf6af16, deepspeed.__version__
+
+
+# Resolved once, at module import time.
+_deepspeed_wf6af16, _DEEPSPEED_VERSION = _load_deepspeed_wf6af16()
+
+# The torch reference is always available, so only the DeepSpeed checks skip.
+if (
+    _deepspeed_wf6af16 is None
+    and flag_train.vendor_name == "nvidia"
+    and torch.cuda.get_device_capability() != (8, 0)
+):
+    _ORACLE_SKIP_REASON = _DEEPSPEED_AMPERE_ONLY_MSG
+elif _deepspeed_wf6af16 is None and flag_train.vendor_name == "hygon":
+    _ORACLE_SKIP_REASON = _DEEPSPEED_HYGON_MSG
+else:
+    _ORACLE_SKIP_REASON = _DEEPSPEED_UNAVAILABLE_MSG
+requires_deepspeed_reference = pytest.mark.skipif(
+    _deepspeed_wf6af16 is None, reason=_ORACLE_SKIP_REASON
+)
+
+
+def _make_case(tokens, in_channels, out_channels, seed=0):
+    """Random FP6 codes/scales/activations plus both packings of the weights."""
+    gen = torch.Generator().manual_seed(seed)
+    codes = torch.randint(0, 64, (out_channels, in_channels), generator=gen).to(
+        torch.uint8
+    )
+    scales = (torch.rand(out_channels, generator=gen) + 0.5).to(torch.float16)
+    hidden = torch.randn(tokens, in_channels, generator=gen).to(torch.float16)
+
+    device = flag_train.device
+    hidden = hidden.to(device)
+    scales = scales.to(device)
+    weights_2bit, weights_4bit = pack_weights_fp6(codes.to(device))
+    return hidden, weights_2bit, weights_4bit, scales
+
+
+def _run_train(hidden, weights_2bit, weights_4bit, scales, split_k=None):
+    tokens, in_channels = hidden.shape
+    out_channels = scales.shape[0]
+    output = torch.empty(
+        (tokens, out_channels), dtype=torch.float16, device=hidden.device
+    )
+    return flag_train.deepspeed.wf6af16_linear(
+        output,
+        hidden,
+        weights_2bit,
+        weights_4bit,
+        scales,
+        out_channels,
+        tokens,
+        in_channels,
+        split_k=split_k,
+    )
+
+
+# Shapes are (tokens, in_channels, out_channels). Deliberately not aligned to
+# the CUDA kernel's 256/64 tiling: the Triton kernel masks its edges, and the
+# torch reference has no alignment constraint at all. in_channels stays a
+# multiple of 4 because the packing is defined in units of 4 codes.
+_SHAPES = [
+    (1, 64, 64),
+    (3, 128, 48),
+    (7, 260, 68),  # K % 16 != 0: byte-path fallback with a masked tail
+    (16, 256, 256),
+    (33, 512, 384),
+    (100, 1024, 512),
+    (1, 4096, 512),  # split-K 8 with word-wide loads over 8 loop iterations
+    (800, 512, 256),  # beyond the split-K map's token range: single pass
+]
+
+
+@pytest.mark.wf6af16_linear
+@pytest.mark.parametrize("shape", _SHAPES)
+def test_wf6af16_linear(shape):
+    """The Triton kernel must match the torch reference on unaligned shapes."""
+    tokens, in_channels, out_channels = shape
+    hidden, weights_2bit, weights_4bit, scales = _make_case(*shape)
+
+    train_out = _run_train(hidden, weights_2bit, weights_4bit, scales)
+    ref_out = wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
+
+    # atol scales with the reduction length, as in any fp16 GEMM comparison.
+    utils.train_assert_close(
+        utils.to_reference(train_out),
+        utils.to_reference(ref_out),
+        torch.float16,
+        reduce_dim=in_channels,
+    )
+
+
+@pytest.mark.wf6af16_linear
+@pytest.mark.parametrize("split_k", [1, 2, 4, 8])
+def test_wf6af16_linear_split_k(split_k):
+    """Split-K partials plus the reduction must agree with the single-pass run."""
+    hidden, weights_2bit, weights_4bit, scales = _make_case(7, 512, 256)
+
+    train_out = _run_train(hidden, weights_2bit, weights_4bit, scales, split_k=split_k)
+    ref_out = wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
+
+    utils.train_assert_close(
+        utils.to_reference(train_out),
+        utils.to_reference(ref_out),
+        torch.float16,
+        reduce_dim=512,
+    )
+
+
+@pytest.mark.wf6af16_linear
+def test_wf6af16_linear_split_k_misaligned_falls_back():
+    """An explicit split_k whose slices would start mid-byte falls back to 1."""
+    hidden, weights_2bit, weights_4bit, scales = _make_case(7, 512, 256)
+
+    train_out = _run_train(hidden, weights_2bit, weights_4bit, scales, split_k=3)
+    ref_out = wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
+
+    utils.train_assert_close(
+        utils.to_reference(train_out),
+        utils.to_reference(ref_out),
+        torch.float16,
+        reduce_dim=512,
+    )
+
+
+@pytest.mark.wf6af16_linear
+def test_wf6af16_linear_rejects_bad_inputs():
+    """Wrong dtypes and non-contiguous tensors are rejected, not miscomputed."""
+    hidden, weights_2bit, weights_4bit, scales = _make_case(7, 512, 256)
+    output = torch.empty((7, 256), dtype=torch.float16, device=hidden.device)
+
+    with pytest.raises(AssertionError):
+        flag_train.deepspeed.wf6af16_linear(
+            output, hidden.float(), weights_2bit, weights_4bit, scales, 256, 7, 512
+        )
+
+    noncontig = torch.randn(512, 7, dtype=torch.float16, device=hidden.device).t()
+    with pytest.raises(AssertionError):
+        flag_train.deepspeed.wf6af16_linear(
+            output, noncontig, weights_2bit, weights_4bit, scales, 256, 7, 512
+        )
+
+
+def _active_gemm():
+    """The bare GEMM kernel and the config list of the registered backend."""
+    module = sys.modules[flag_train.deepspeed.wf6af16_linear.__module__]
+    autotuner = module.wf6af16_linear_kernel.fn  # LibEntry -> Autotuner
+    return autotuner.fn, autotuner.configs
+
+
+def _run_config(bare, config, hidden, w2, w4, scales, split_k, wide_load):
+    """One launch of the bare GEMM kernel pinned to an explicit config."""
+    tokens, in_channels = hidden.shape
+    out_channels = scales.shape[0]
+    grid = (
+        triton.cdiv(out_channels, config.kwargs["BLOCK_M"])
+        * triton.cdiv(tokens, config.kwargs["BLOCK_N"])
+        * split_k,
+    )
+    meta = dict(config.kwargs)
+    meta.update(num_warps=config.num_warps, num_stages=config.num_stages)
+    # wide_load=None: the kernel has no WIDE_LOAD parameter (the Ascend
+    # variant drops the path entirely instead of just disabling it).
+    if wide_load is not None:
+        meta["WIDE_LOAD"] = wide_load
+
+    output = torch.empty(
+        (tokens, out_channels), dtype=torch.float16, device=hidden.device
+    )
+    if split_k == 1:
+        bare[grid](
+            output,
+            hidden,
+            w2,
+            w4,
+            scales,
+            out_channels,
+            tokens,
+            in_channels,
+            split_k,
+            SPLIT_K_MODE=False,
+            **meta,
+        )
+        return output
+
+    workspace = torch.empty(
+        (split_k, tokens, out_channels), dtype=torch.float32, device=hidden.device
+    )
+    bare[grid](
+        workspace,
+        hidden,
+        w2,
+        w4,
+        scales,
+        out_channels,
+        tokens,
+        in_channels,
+        split_k,
+        SPLIT_K_MODE=True,
+        **meta,
+    )
+    reduce_kernel = sys.modules[
+        "flag_train.deepspeed.wf6af16_linear"
+    ].wf6af16_split_k_reduce_kernel
+    total = tokens * out_channels
+    reduce_kernel[(triton.cdiv(total, 1024),)](
+        workspace, output, total, split_k, BLOCK_SIZE=1024
+    )
+    return output
+
+
+@pytest.mark.wf6af16_linear
+def test_wf6af16_linear_all_configs():
+    """Every config in the active autotune space must compute correctly.
+
+    Autotune scores speed, not correctness: a config that miscompiles on a
+    platform can win tuning and only show up as wrong results. Sweep the
+    whole space explicitly -- on the byte path everywhere, plus the wide
+    path on the backends whose wrapper enables it -- so a bad entry fails
+    here instead of on whichever shape happens to select it.
+    """
+    bare, configs = _active_gemm()
+    wide_values = [False, True]
+    if flag_train.vendor_name == "iluvatar":
+        # The CoreX backend never enables WIDE_LOAD (it miscompiles there).
+        wide_values = [False]
+    elif flag_train.vendor_name == "ascend":
+        # WIDE_LOAD casts the packed weights to uint32 pointers, which
+        # BiShengHIR rejects at compile time (unmatched bitwidth); the Ascend
+        # kernel drops the path entirely, so there is nothing to pin here.
+        wide_values = [None]
+    for tokens, in_channels, out_channels, split_k in [
+        (1, 64, 64, 1),
+        (7, 512, 256, 4),
+    ]:
+        hidden, w2, w4, scales = _make_case(tokens, in_channels, out_channels)
+        ref_out = wf6af16_ref(hidden, w2, w4, scales)
+        for config in configs:
+            for wide_load in wide_values:
+                out = _run_config(
+                    bare, config, hidden, w2, w4, scales, split_k, wide_load
+                )
+                try:
+                    utils.train_assert_close(
+                        utils.to_reference(out),
+                        utils.to_reference(ref_out),
+                        torch.float16,
+                        reduce_dim=in_channels,
+                    )
+                except AssertionError as e:
+                    raise AssertionError(
+                        f"config {config}, WIDE_LOAD={wide_load}, shape "
+                        f"({tokens}, {in_channels}, {out_channels}), "
+                        f"split_k={split_k}:\n{e}"
+                    ) from e
+
+
+@pytest.mark.wf6af16_linear
+@requires_deepspeed_reference
+@pytest.mark.parametrize("tokens", [1, 7, 64, 65, 200])
+def test_matches_deepspeed_oracle(tokens):
+    """Pin the DeepSpeed oracle explicitly, so a run that quietly stopped
+    reaching it (deepspeed missing) is visible rather than silently thinner.
+
+    DeepSpeed's CUDA kernel requires out_channels % 256 == 0 and in_channels %
+    64 == 0, hence the fixed weight shape here.
+    """
+    hidden, weights_2bit, weights_4bit, scales = _make_case(tokens, 512, 256)
+
+    train_out = _run_train(hidden, weights_2bit, weights_4bit, scales)
+    ds_out = _deepspeed_wf6af16(hidden, weights_2bit, weights_4bit, scales)
+
+    utils.train_assert_close(
+        utils.to_reference(train_out),
+        utils.to_reference(ds_out),
+        torch.float16,
+        reduce_dim=512,
+    )
