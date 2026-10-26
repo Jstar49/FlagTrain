@@ -38,9 +38,15 @@ biases, activates and scatters it to the three segment outputs. That reads
 single-kernel form cannot: Triton 3.6 miscompiles a pipelined loop whose tile
 feeds both ``tl.dot`` and a reduction (wrong, non-deterministic accumulator
 rows), and the unpipelined single-kernel loop measured slower than these two
-pipelined passes together on the H20 mHC shapes. The norm kernel keeps its
-per-``K``-tile squares in an fp32 tile accumulator and reduces once after the
-loop, so the pipelined loop contains no reduction.
+pipelined passes together on the H20 mHC shapes.
+
+The norm kernel keeps the plainest possible loop body -- load, fp32 square,
+row ``tl.sum`` -- with no ``tl.dot`` in the loop, so the dot/reduction
+interaction above does not apply and no tile-sized accumulator is needed.
+A ``K`` that fits in one tile also turns pipelining off (``STAGES=1``): the
+loop cannot pipeline across a single iteration, and a vendor compiler that
+mis-handles the prologue/epilogue of such a loop produces a wrong ``r``
+(observed on Iluvatar's Triton 3.2 fork for M=1, K=128).
 
 Precision: with fp32 operands ``tl.dot`` uses the backend's default input
 precision (tf32 on NVIDIA), which is what Megatron's cuTile forward uses
@@ -68,6 +74,14 @@ logger = logging.getLogger(__name__)
 _NUM_WARPS = 4
 _NUM_STAGES = 3
 
+# Vendor workaround: Iluvatar's Triton 3.2 fork miscompiles the pipelined norm
+# loop. A [BLOCK_M, BLOCK_K] square accumulator on a single-iteration loop
+# returned r ~ 0.75x, and the next revision still returned a near-zero r for
+# K=1000 (h_pre saturates to compute_h_eps / 1.0). The norm kernel is
+# memory-latency bound without pipelining, so on that vendor correctness wins
+# over the pipeline; every other vendor keeps _NUM_STAGES.
+_NORM_STAGES = 1 if runtime_device.vendor_name == "iluvatar" else _NUM_STAGES
+
 # RMS kernel: one program covers a small row block and the full K axis.
 _NORM_BLOCK_M = 32
 _NORM_BLOCK_K = 256
@@ -80,6 +94,14 @@ _PROJ_BLOCK_M_LARGE = 64
 _PROJ_BLOCK_K_LARGE = 128
 _PROJ_BLOCK_M_SMALL = 32
 _PROJ_BLOCK_K_SMALL = 256
+
+# Triton allocates one shared-memory buffer per pipelined tile per stage, so
+# the projection kernel needs _NUM_STAGES * (x_tile + weight_tile) bytes. That
+# overruns devices with a 128 KiB limit (Iluvatar reports "Required: 147456,
+# Hardware limit: 131072" for 32x256 tiles with a bf16 x and fp32 weight), so
+# _proj_config halves BLOCK_K until the estimate fits. 128 KiB is the tightest
+# limit among the supported platforms; devices with more keep the larger tile.
+_SHARED_MEMORY_BUDGET = 128 * 1024
 
 _MIN_BLOCK_N = 16
 
@@ -129,10 +151,12 @@ def _rms_norm_kernel(
 ):
     """``r = ||x|| / sqrt(K)`` for BLOCK_M rows, pipelined over K.
 
-    The per-tile squares accumulate in an fp32 ``[BLOCK_M, BLOCK_K]`` tile and
-    are reduced once after the loop. A reduction inside the loop is what
-    Triton 3.6 miscompiles when the same tile also feeds ``tl.dot``; keeping the
-    loop reduction-free lets it pipeline (it reaches HBM bandwidth here).
+    The loop body is only a load, an fp32 square and a row reduction: this
+    kernel has no ``tl.dot``, so the dot/reduction pipelining miscompile does
+    not apply, and no tile-sized square accumulator is needed. The simpler
+    form also compiles correctly on vendor Triton forks (a ``[BLOCK_M,
+    BLOCK_K]`` accumulator with a single-iteration pipelined loop produced a
+    wrong ``r`` on Iluvatar's 3.2 fork).
     """
     pid = tl.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -141,7 +165,7 @@ def _rms_norm_kernel(
     # Row offsets scale by K (up to M*K elements), which can exceed int32.
     x_rows = x_ptr + rows.to(tl.int64)[:, None] * K
 
-    sq = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    sum_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
     for k0 in tl.range(0, K, BLOCK_K, num_stages=STAGES):
         ks_mask = k0 + ks < K
         x_tile = tl.load(
@@ -151,9 +175,9 @@ def _rms_norm_kernel(
         )
         # Squaring in bf16/fp16 loses most of the RMS scale's precision.
         x_fp32 = x_tile.to(tl.float32)
-        sq += x_fp32 * x_fp32
+        sum_sq += tl.sum(x_fp32 * x_fp32, axis=1)
 
-    r = tl.sqrt(tl.sum(sq, axis=1) / K.to(tl.float32))
+    r = tl.sqrt(sum_sq / K.to(tl.float32))
     tl.store(r_ptr + rows, r, mask=row_mask)
 
 
@@ -261,21 +285,54 @@ def _proj_compute_h_kernel(
     )
 
 
-def _norm_config(K):
-    """Tile sizes for the RMS kernel."""
+def _pipeline_stages(K, block_k, max_stages=_NUM_STAGES):
+    """One K tile means no cross-iteration overlap, so do not pipeline it."""
+    return 1 if K <= block_k else max_stages
+
+
+def _norm_config(K, x_itemsize):
+    """Tile sizes and pipeline depth for the RMS kernel."""
     block_k = max(16, min(_NORM_BLOCK_K, triton.next_power_of_2(max(K, 1))))
-    return _NORM_BLOCK_M, block_k
+    stages = _pipeline_stages(K, block_k, _NORM_STAGES)
+    while block_k > 16 and (
+        stages * _NORM_BLOCK_M * block_k * x_itemsize > _SHARED_MEMORY_BUDGET
+    ):
+        block_k //= 2
+        stages = _pipeline_stages(K, block_k, _NORM_STAGES)
+    return _NORM_BLOCK_M, block_k, stages
 
 
-def _proj_config(M, N, K):
-    """Tile sizes for the projection kernel; tl.dot needs axes of at least 16."""
+def _proj_shared_bytes(block_m, block_n, block_k, x_itemsize, weight_itemsize, stages):
+    """Shared memory Triton allocates for the projection kernel's pipeline."""
+    return stages * (
+        block_m * block_k * x_itemsize + block_k * block_n * weight_itemsize
+    )
+
+
+def _proj_config(M, N, K, x_itemsize, weight_itemsize):
+    """Tile sizes for the projection kernel; tl.dot needs axes of at least 16.
+
+    ``BLOCK_K`` also has to keep the pipelined tile buffers within
+    ``_SHARED_MEMORY_BUDGET``; the tile bytes are what Triton reports as
+    ``metadata.shared``, so this is the same quantity the launch checks.
+    """
     block_n = max(_MIN_BLOCK_N, triton.next_power_of_2(N))
     if M >= _PROJ_LARGE_M:
         block_m, block_k = _PROJ_BLOCK_M_LARGE, _PROJ_BLOCK_K_LARGE
     else:
         block_m, block_k = _PROJ_BLOCK_M_SMALL, _PROJ_BLOCK_K_SMALL
     block_k = max(16, min(block_k, triton.next_power_of_2(max(K, 1))))
-    return block_m, block_n, block_k
+    stages = _pipeline_stages(K, block_k)
+    while (
+        block_k > 16
+        and _proj_shared_bytes(
+            block_m, block_n, block_k, x_itemsize, weight_itemsize, stages
+        )
+        > _SHARED_MEMORY_BUDGET
+    ):
+        block_k //= 2
+        stages = _pipeline_stages(K, block_k)
+    return block_m, block_n, block_k, stages
 
 
 def fused_proj_rms_compute_h_fwd(
@@ -366,8 +423,10 @@ def fused_proj_rms_compute_h_fwd(
         # No launch when there are no rows to map.
         return h_pre, h_post, h_res, r, proj
 
-    norm_m, norm_k = _norm_config(K)
-    block_m, block_n, block_k = _proj_config(M, N, K)
+    norm_m, norm_k, norm_stages = _norm_config(K, x.element_size())
+    block_m, block_n, block_k, proj_stages = _proj_config(
+        M, N, K, x.element_size(), weight.element_size()
+    )
 
     with torch_device_fn.device(device):
         _rms_norm_kernel[(triton.cdiv(M, norm_m),)](
@@ -377,9 +436,9 @@ def fused_proj_rms_compute_h_fwd(
             K,
             BLOCK_M=norm_m,
             BLOCK_K=norm_k,
-            STAGES=_NUM_STAGES,
+            STAGES=norm_stages,
             num_warps=_NUM_WARPS,
-            num_stages=_NUM_STAGES,
+            num_stages=norm_stages,
         )
         _proj_compute_h_kernel[(triton.cdiv(M, block_m),)](
             x,
@@ -404,9 +463,9 @@ def fused_proj_rms_compute_h_fwd(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
-            STAGES=_NUM_STAGES,
+            STAGES=proj_stages,
             num_warps=_NUM_WARPS,
-            num_stages=_NUM_STAGES,
+            num_stages=proj_stages,
         )
 
     return h_pre, h_post, h_res, r, proj
