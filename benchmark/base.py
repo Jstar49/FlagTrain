@@ -37,6 +37,8 @@ from .consts import (
     BenchmarkResult,
     OperationAttribute,
     check_metric_dependencies,
+    lookup_base_record_ex,
+    lookup_scaling_factor,
     model_shapes,
 )
 
@@ -545,7 +547,9 @@ class Benchmark:
                         f"dtype={dtype} err=<<<{e}>>>"
                     )
                     pytest.fail(str(e))
-                metrics.append(self._measure_input(input))
+                metric = self._measure_input(input)
+                self._record_base_comparison(metric, dtype)
+                metrics.append(metric)
             results.append(self._emit_result(dtype, metrics))
         return results
 
@@ -574,12 +578,56 @@ class Benchmark:
                         f"case_id={case.case_id} err=<<<{e}>>>"
                     )
                     pytest.fail(str(e))
-                metrics.append(self._measure_input(input, case_id=case.case_id))
+                metric = self._measure_input(input, case_id=case.case_id)
+                self._record_base_comparison(metric, dtype)
+                metrics.append(metric)
                 executed.append(case.case_id)
             if metrics:
                 results.append(self._emit_result(dtype, metrics))
         Config.executed_case_ids.update(executed)
         return results
+
+    def _record_base_comparison(self, metric, dtype):
+        """Fill ``compared_speedup`` from the optional NVIDIA baseline.
+
+        Ported from FlagGems-vllm's benchmark/base.py: the raw cross-hardware
+        time ratio is divided by the peak scaling factor of the resource that
+        bottlenecks the baseline record. When the record or the factor is
+        missing, the raw ratio is kept and the precise miss reason is recorded.
+        """
+        if Config.base_data is None or not metric.latency:
+            return
+        base_rec, miss_reason = lookup_base_record_ex(
+            Config.base_data,
+            self.op_name,
+            dtype,
+            metric.shape_detail,
+            getattr(self, "base_variant", None),
+        )
+        base_ms = base_rec.get("latency_ms") if base_rec else None
+        if base_ms is None:
+            metric.base_miss_reason = miss_reason
+            print(f"[vs Base][miss] {miss_reason}")
+            return
+        # Both values are milliseconds, so the raw ratio is dimensionless.
+        # Divide by this chip's scaling factor for the baseline's bottleneck
+        # resource to normalize away the hardware peak gap; a missing factor
+        # keeps the raw ratio.
+        speedup = base_ms / metric.latency
+        factor = lookup_scaling_factor(
+            Config.base_data,
+            vendor_name,
+            base_rec.get("bottle_neck_unit"),
+            dtype,
+        )
+        if factor:
+            speedup /= factor
+        metric.compared_speedup = speedup
+        print(
+            f"[vs Base] {self.op_name} shape={metric.shape_detail} "
+            f"base={base_ms:.6f}ms train={metric.latency:.6f}ms "
+            f"factor={factor} vs_base={speedup:.3f}"
+        )
 
     def _measure_input(self, input, case_id=None):
         metric = BenchmarkMetrics(case_id=case_id)

@@ -46,6 +46,14 @@
 # Which shape a backend gets is data, not a name check: a container: block in
 # .github/backends.json selects the container job, its absence the native one.
 #
+# The performance stage writes benchmark_result.json with --record json and
+# passes --base-data=tools/op_flagtrain_perf_baseline.json, then runs
+# tools/perf_summary.py: every shape uses compared_speedup when the NVIDIA
+# baseline matched (otherwise the local torch-baseline speedup), and the tool
+# writes per-dtype/op summaries (summary.json/csv/md) that are uploaded with
+# the accuracy report. --base-data is optional: a missing baseline disables
+# the "vs Base" column without failing the run.
+#
 # No shape uses a secret: a fork's PR builds and tests exactly like a branch
 # here.
 
@@ -209,10 +217,10 @@ jobs:
               ${test_targets} --ref=cpu --quick || failures=$((failures + 1))
           if [ "${fail_fast}" = "true" ] && [ "${failures}" -ne 0 ]; then exit 1; fi
 
-          # Performance, FlagGems' mode: --level core --record log. Runs with
-          # /out as the working dir so the log lands outside the workspace.
-          # A full run covers every component's benchmarks, like the
-          # correctness pass covering tests/ -- not just deepspeed's.
+          # Performance, FlagGems' mode: --level core. The JSON report feeds
+          # tools/perf_summary.py; --base-data adds the "vs Base" comparison
+          # against the committed NVIDIA baseline. A full run covers every
+          # component's benchmarks, like the correctness pass covering tests/.
           if [ "${BENCH_TARGETS}" = "__ALL__" ]; then
             bench_targets="benchmark/"
           else
@@ -222,11 +230,26 @@ jobs:
             bench_abs=""
             for b in ${bench_targets}; do bench_abs="${bench_abs} /work/${b}"; done
             echo "performance targets: ${bench_targets}"
+            # A reused runner may still hold a report; the benchmark conftest
+            # merges into an existing --output file.
+            rm -f "${results}/benchmark_result.json"
             # No -x here, unlike the correctness stages: FlagGems runs every
             # selected benchmark and reports all of their failures together.
+            # /work is the checkout and /out is ${results}; the '=' form of
+            # --base-data keeps pytest from treating the path as a test file.
             docker run "${docker_opts[@]}" -w /out "${IMAGE}" \
               pytest -v -p no:cacheprovider --level core \
-                --record log ${bench_abs} || failures=$((failures + 1))
+                --record json --output /out/benchmark_result.json \
+                --base-data=/work/tools/op_flagtrain_perf_baseline.json \
+                ${bench_abs} || failures=$((failures + 1))
+
+            if [ -f "${results}/benchmark_result.json" ]; then
+              docker run "${docker_opts[@]}" -w /work "${IMAGE}" \
+                python3 tools/perf_summary.py \
+                  --input /out/benchmark_result.json \
+                  --output-dir /out/perf-summary \
+                || failures=$((failures + 1))
+            fi
           else
             echo "no performance targets for this change; skipping the performance suites"
           fi
@@ -243,6 +266,16 @@ jobs:
         with:
           name: accuracy-result
           path: ${{ runner.temp }}/flagtrain-results/accuracy_result.json
+          if-no-files-found: ignore
+
+      - name: Upload the performance summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: perf-summary-${{ inputs.backend }}
+          path: |
+            ${{ runner.temp }}/flagtrain-results/perf-summary
+            ${{ runner.temp }}/flagtrain-results/benchmark_result.json
           if-no-files-found: ignore
 
   test-container:
@@ -333,8 +366,8 @@ jobs:
         run: |
           # Same scoping as the correctness step: the operators this PR
           # touched, or every component's benchmarks on a full run. FlagGems'
-          # mode (--level core --record log), without -x: every selected
-          # benchmark runs so the log reports all of their failures.
+          # mode (--level core), without -x: every selected benchmark runs so
+          # the JSON reports all of their failures.
           if [ "${BENCH_TARGETS}" = "__ALL__" ]; then
             bench_targets="benchmark/"
           else
@@ -345,18 +378,25 @@ jobs:
             exit 0
           fi
 
-          # Run from $RUNNER_TEMP: --record log writes result_*.log into the
-          # working directory, and the workspace must not collect root-owned
-          # files. The targets are made absolute because the working directory
-          # is no longer the repository root.
+          # Run from $RUNNER_TEMP: the report and the summary land outside the
+          # workspace. The targets are made absolute because the working
+          # directory is no longer the repository root. The '=' form of
+          # --base-data keeps pytest from treating the path as a test file.
           results="${RUNNER_TEMP}/flagtrain-results"
           mkdir -p "${results}"
+          rm -f "${results}/benchmark_result.json"
           bench_abs=""
           for b in ${bench_targets}; do bench_abs="${bench_abs} ${GITHUB_WORKSPACE}/${b}"; done
           echo "performance targets: ${bench_targets}"
           cd "${results}"
           pytest -v -p no:cacheprovider --level core \
-            --record log ${bench_abs}
+            --record json --output "${results}/benchmark_result.json" \
+            --base-data="${GITHUB_WORKSPACE}/tools/op_flagtrain_perf_baseline.json" \
+            ${bench_abs}
+
+          python3 "${GITHUB_WORKSPACE}/tools/perf_summary.py" \
+            --input "${results}/benchmark_result.json" \
+            --output-dir "${results}/perf-summary"
 
       - name: Upload the accuracy report
         if: always()
@@ -364,6 +404,16 @@ jobs:
         with:
           name: accuracy-result-${{ inputs.backend }}
           path: ${{ runner.temp }}/flagtrain-results/accuracy_result.json
+          if-no-files-found: ignore
+
+      - name: Upload the performance summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: perf-summary-${{ inputs.backend }}
+          path: |
+            ${{ runner.temp }}/flagtrain-results/perf-summary
+            ${{ runner.temp }}/flagtrain-results/benchmark_result.json
           if-no-files-found: ignore
 
   test-native:
@@ -455,16 +505,25 @@ jobs:
             exit 0
           fi
 
-          # --record log writes result_*.log into the working directory, so run
-          # from $RUNNER_TEMP and pass the targets absolutely.
+          # The report and the summary are written under $RUNNER_TEMP and the
+          # targets are absolute because the working directory is no longer
+          # the repository root. The '=' form of --base-data keeps pytest
+          # from treating the path as a test file.
           results="${RUNNER_TEMP}/flagtrain-results"
           mkdir -p "${results}"
+          rm -f "${results}/benchmark_result.json"
           bench_abs=""
           for b in ${bench_targets}; do bench_abs="${bench_abs} ${GITHUB_WORKSPACE}/${b}"; done
           echo "performance targets: ${bench_targets}"
           cd "${results}"
           pytest -v -p no:cacheprovider --level core \
-            --record log ${bench_abs}
+            --record json --output "${results}/benchmark_result.json" \
+            --base-data="${GITHUB_WORKSPACE}/tools/op_flagtrain_perf_baseline.json" \
+            ${bench_abs}
+
+          python3 "${GITHUB_WORKSPACE}/tools/perf_summary.py" \
+            --input "${results}/benchmark_result.json" \
+            --output-dir "${results}/perf-summary"
 
       - name: Upload the accuracy report
         if: always()
@@ -472,4 +531,14 @@ jobs:
         with:
           name: accuracy-result-${{ inputs.backend }}
           path: ${{ runner.temp }}/flagtrain-results/accuracy_result.json
+          if-no-files-found: ignore
+
+      - name: Upload the performance summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: perf-summary-${{ inputs.backend }}
+          path: |
+            ${{ runner.temp }}/flagtrain-results/perf-summary
+            ${{ runner.temp }}/flagtrain-results/benchmark_result.json
           if-no-files-found: ignore
