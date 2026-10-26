@@ -260,6 +260,12 @@ RUN set -eux; \
 # backends.yaml if the CI needs that determinism.
 # pytest/pyyaml/sqlalchemy are what the suites import: conftest's yaml
 # handling, the tune configs, and flag_train.utils.models.sql.
+# megatron-core is the upstream reference some tests/megatron/ modules import.
+# It is baked here rather than only listed in backends.yaml because the nvidia
+# job (test-nvidia) never runs tools/setup_env.sh: this image IS its
+# environment, so a `deps:` entry in backends.yaml does not reach it. Keep the
+# pin in sync with backends.yaml. `torch>=2.6.0` is already satisfied by the
+# torch installed above, so pip does not replace it.
 # All of these come from the mirror; the nexus does not carry them, so no
 # extra index is passed here — a package resolving from somewhere unexpected
 # would be a surprise, not a rescue.
@@ -267,8 +273,9 @@ RUN set -eux; \
     pip install --no-cache-dir \
         "deepspeed==0.19.7" \
         deepspeed-kernels \
+        "megatron-core==0.19.2" \
         pytest pyyaml sqlalchemy; \
-    pip list --format=freeze | grep -iE '^(deepspeed|pytest|pyyaml|sqlalchemy|dskernels)'
+    pip list --format=freeze | grep -iE '^(deepspeed|megatron-core|pytest|pyyaml|sqlalchemy|dskernels)'
 
 # --- setuptools for the run-time editable install --------------------------
 # The repo's pyproject needs setuptools>=77 (PEP 639 license-files metadata);
@@ -323,7 +330,7 @@ print("JIT probe compiled, linked and imported:", module.__file__)'; \
 # the venv check makes sure the module is flagtree's and not a stray system
 # triton that PATH happens to reach.
 RUN set -eux; \
-    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import sys, torch, triton, deepspeed, yaml, sqlalchemy, dskernels; \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import sys, torch, triton, deepspeed, megatron.core, yaml, sqlalchemy, dskernels; \
 assert triton.__file__ and hasattr(triton, "Config"), "triton install is incomplete"; \
 assert triton.__file__.startswith(sys.prefix), "triton came from outside the venv: " + str(triton.__file__); \
 assert torch.version.cuda == "13.0", torch.version.cuda; \

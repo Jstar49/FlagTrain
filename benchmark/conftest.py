@@ -111,6 +111,33 @@ class BenchConfig:
         self.mm_layout = None
         self.skip_native = False
         self.native_baseline_skip_reason = None
+        # NVIDIA baseline data loaded from --base-data; None means "disabled".
+        self.base_data = None
+
+
+def _load_base_data(path):
+    """Load the NVIDIA baseline JSON for the optional 'vs Base' column.
+
+    Returns the parsed dict, or None when no path is given or the file cannot
+    be read/parsed. Never raises: a missing or malformed baseline must not break
+    the benchmark run (it silently degrades to N/A).
+    """
+    if not path:
+        print("[base-data] no --base-data given; 'vs Base' is disabled.")
+        return None
+    try:
+        with open(path, "r") as handle:
+            data = json.load(handle)
+        n_ops = sum(1 for key in data if not key.startswith("_"))
+        has_sf = "_scaling_factors" in data
+        print(
+            f"[base-data] loaded {path}: {n_ops} operators, "
+            f"_scaling_factors={'yes' if has_sf else 'no'}."
+        )
+        return data
+    except (OSError, ValueError) as error:
+        print(f"[base-data] failed to load {path}: {error}; 'vs Base' is disabled.")
+        return None
 
 
 def _get_native_baseline_skip_reason(marker, current_vendor):
@@ -201,6 +228,18 @@ def pytest_addoption(parser):
         "--warmup",
         default=consts.DEFAULT_WARMUP_TIME,
         help="Time(ms) of warmup runs before benchmark run.",
+    )
+
+    parser.addoption(
+        "--base-data",
+        action="store",
+        default=None,
+        required=False,
+        help=(
+            "Path to an NVIDIA baseline JSON (e.g. op_flagtrain_perf_baseline.json). "
+            "When provided, benchmarks show a 'vs Base' column and record "
+            "compared_speedup. If omitted or unreadable, behavior is unchanged."
+        ),
     )
 
     parser.addoption(
@@ -330,6 +369,7 @@ def pytest_configure(config):
     )
 
     Config = BenchConfig()
+    Config.base_data = _load_base_data(config.getoption("--base-data"))
     CASE_LISTS.clear()
     TEST_RESULTS.clear()
 
