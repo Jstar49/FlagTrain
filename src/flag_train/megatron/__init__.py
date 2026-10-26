@@ -8,8 +8,8 @@ from .fused_proj_rms_compute_h import fused_proj_rms_compute_h_fwd
 from .quick_gelu import quick_gelu
 
 __all__ = [
-    "fused_proj_rms_compute_h_fwd",
     "fused_indices_to_multihot",
+    "fused_proj_rms_compute_h_fwd",
     "quick_gelu",
 ]
 
