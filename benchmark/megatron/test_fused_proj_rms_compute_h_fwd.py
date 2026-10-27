@@ -110,26 +110,7 @@ def _megatron_torch_forward(
 
 
 def _load_megatron_forward():
-    # Prefer the installed Megatron (which may dispatch to its cuTile kernel);
-    # the verbatim copy keeps the baseline aligned when the installed release
-    # predates the mHC kernels (megatron-core 0.19.2 does not ship this module).
-    try:
-        import megatron.core.fusions.fused_mhc_kernels as fused_mhc_kernels
-
-        kernel = fused_mhc_kernels.fused_proj_rms_compute_h
-    except (ImportError, AttributeError):
-        return _megatron_torch_forward
-
-    def eager_forward(*args, **kwargs):
-        # Megatron 0.21 wraps its torch path in @torch.compile. Benchmark the
-        # eager ATen path, as the previous torch baseline did, instead of
-        # making the reading depend on Inductor's async compile pool.
-        import torch._dynamo
-
-        with torch._dynamo.config.patch(disable=True):
-            return kernel(*args, **kwargs)
-
-    return eager_forward
+    return _megatron_torch_forward
 
 
 torch_op = _load_megatron_forward()

@@ -108,15 +108,7 @@ def _megatron_torch_forward(
 
 
 def base_op():
-    # Prefer the installed Megatron (which may dispatch to its cuTile kernel);
-    # the verbatim copy keeps the baseline aligned when the installed release
-    # predates the mHC kernels (megatron-core 0.19.2 does not ship this module).
-    try:
-        import megatron.core.fusions.fused_mhc_kernels as fused_mhc_kernels
-
-        return fused_mhc_kernels.fused_proj_rms_compute_h
-    except (ImportError, AttributeError):
-        return _megatron_torch_forward
+    return _megatron_torch_forward
 
 
 reference_fused_proj_rms_compute = base_op()
