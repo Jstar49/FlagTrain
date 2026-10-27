@@ -116,9 +116,20 @@ def _load_megatron_forward():
     try:
         import megatron.core.fusions.fused_mhc_kernels as fused_mhc_kernels
 
-        return fused_mhc_kernels.fused_proj_rms_compute_h
+        kernel = fused_mhc_kernels.fused_proj_rms_compute_h
     except (ImportError, AttributeError):
         return _megatron_torch_forward
+
+    def eager_forward(*args, **kwargs):
+        # Megatron 0.21 wraps its torch path in @torch.compile. Benchmark the
+        # eager ATen path, as the previous torch baseline did, instead of
+        # making the reading depend on Inductor's async compile pool.
+        import torch._dynamo
+
+        with torch._dynamo.config.patch(disable=True):
+            return kernel(*args, **kwargs)
+
+    return eager_forward
 
 
 torch_op = _load_megatron_forward()

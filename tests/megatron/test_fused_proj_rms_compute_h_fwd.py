@@ -124,13 +124,20 @@ reference_fused_proj_rms_compute = base_op()
 
 def _reference(*args):
     """Call the Megatron reference; ``--ref cpu`` uses CPU float64 inputs."""
-    if utils.TO_CPU:
-        args = tuple(
-            arg.cpu().double() if isinstance(arg, torch.Tensor) else arg for arg in args
-        )
-        # The CPU oracle must take Megatron's torch path, not a device kernel.
-        return reference_fused_proj_rms_compute(*args, backend="native")
-    return reference_fused_proj_rms_compute(*args)
+    # Megatron 0.21 wraps its torch path in @torch.compile. Run the reference
+    # eagerly: the test is about the operator's semantics, and depending on
+    # Inductor's async compile subprocess makes it flaky under suite load.
+    import torch._dynamo
+
+    with torch._dynamo.config.patch(disable=True):
+        if utils.TO_CPU:
+            args = tuple(
+                arg.cpu().double() if isinstance(arg, torch.Tensor) else arg
+                for arg in args
+            )
+            # The CPU oracle must take Megatron's torch path, not a device kernel.
+            return reference_fused_proj_rms_compute(*args, backend="native")
+        return reference_fused_proj_rms_compute(*args)
 
 
 def _inputs(M, n, K, x_dtype, weight_dtype, aux_dtype=torch.float32, seed=0):
