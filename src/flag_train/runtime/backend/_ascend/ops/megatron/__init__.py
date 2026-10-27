@@ -25,7 +25,9 @@ overrides.
 """
 
 from .fused_indices_to_multihot import fused_indices_to_multihot
+from .fused_pad_routing_map import fused_pad_routing_map
 
 __all__ = [
     "fused_indices_to_multihot",
+    "fused_pad_routing_map",
 ]
