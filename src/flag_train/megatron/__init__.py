@@ -4,11 +4,13 @@ from flag_train.runtime import device as runtime_device
 from flag_train.runtime.backend import SpecOpRegistrar
 
 from .fused_indices_to_multihot import fused_indices_to_multihot
-from .fused_proj_rms_compute_h import fused_proj_rms_compute_h_fwd
+from .fused_proj_rms_compute_h_bwd import fused_proj_rms_compute_h_bwd
+from .fused_proj_rms_compute_h_fwd import fused_proj_rms_compute_h_fwd
 from .quick_gelu import quick_gelu
 
 __all__ = [
     "fused_indices_to_multihot",
+    "fused_proj_rms_compute_h_bwd",
     "fused_proj_rms_compute_h_fwd",
     "quick_gelu",
 ]

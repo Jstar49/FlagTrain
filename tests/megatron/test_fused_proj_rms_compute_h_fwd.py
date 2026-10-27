@@ -24,7 +24,7 @@ magnitudes stay well-conditioned.
 
 Run with::
 
-    pytest -m fused_proj_rms_compute_h tests/megatron -vs
+    pytest -m fused_proj_rms_compute_h_fwd tests/megatron -vs
 """
 
 import math
@@ -35,8 +35,6 @@ import torch
 import flag_train
 
 from .. import accuracy_utils as utils
-
-pytestmark = pytest.mark.fused_proj_rms_compute_h
 
 # M=0 has no launch, M=1 exercises row masking, n=3 gives N=15 (padded to 16),
 # K=1000 is not a multiple of the K tile, and (128, 4, 4096) is the mHC shape.
