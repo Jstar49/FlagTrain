@@ -32,7 +32,13 @@ Include a reference implementation, forward and gradient checks as applicable,
 numerical tolerances, and reproducible performance measurements. Document the
 component versions and hardware used. See [development guidance](docs/development.md).
 
-The initial skeleton does not yet include operator tests or repository CI.
+Dependency changes follow the [installation guide](docs/installation.md):
+the shared stack (torch, flagtree, numpy, vendor runtimes) belongs in
+[build-infra](https://github.com/flagos-ai/build-infra), repo-wide Python
+packages go in `pyproject.toml`, and vendor-specific pins go in `backends.yaml`
+followed by `python3 tools/sync_pyproject_extras.py --write`. Do not add a
+repository Dockerfile for dependencies the public images can provide.
+
 Add executable test instructions alongside each implementation. Describe the
 validation performed in your pull request, including any checks that could not
 be run and why.

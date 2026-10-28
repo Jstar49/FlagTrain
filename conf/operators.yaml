@@ -1,0 +1,170 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+ops:
+- id: blocked_flash
+  description: Blocked flash attention over paged KV-cache blocks.
+  for:
+  - BlockedFlashAttn
+  labels:
+  - deepspeed
+  - attention
+  from:
+  - deepspeed
+  kind:
+  - Attention
+  source: deepspeed.inference.v2.kernels.ragged_ops
+  stages:
+  - beta: '0.0.0'
+- id: evoformer_attn
+  description: Evoformer attention forward kernel (the backward pass is not ported).
+  for:
+  - DS4Sci_EvoformerAttention
+  labels:
+  - deepspeed
+  - attention
+  - evoformer
+  from:
+  - deepspeed
+  kind:
+  - Attention
+  source: deepspeed.ops.deepspeed4science
+  stages:
+  - beta: '0.0.0'
+- id: fused_indices_to_multihot
+  description: Converts fused expert indices and routing probabilities into a multi-hot mask.
+  for:
+  - fused_indices_to_multihot
+  labels:
+  - megatron
+  - moe
+  from:
+  - megatron
+  kind:
+  - MoE
+  source: megatron.core.fusions.fused_indices_converter
+  stages:
+  - beta: '0.0.0'
+- id: fused_pad_routing_map
+  description: Pads a token-to-expert routing map to a multiple of pad_multiple.
+  for:
+  - fused_pad_routing_map
+  labels:
+  - megatron
+  - moe
+  from:
+  - megatron
+  kind:
+  - MoE
+  source: megatron.core.fusions.fused_pad_routing_map
+  stages:
+  - beta: '0.0.0'
+- id: lamb
+  description: Fused LAMB optimizer update.
+  for:
+  - fused_lamb
+  labels:
+  - deepspeed
+  - optimizer
+  from:
+  - deepspeed
+  kind:
+  - Optimizer
+  source: deepspeed.ops.op_builder.FusedLambBuilder
+  stages:
+  - beta: '0.0.0'
+- id: mixed_moe_gemm
+  description: Grouped GEMM for mixed-precision MoE experts.
+  for:
+  - mixed_moe_gemm
+  labels:
+  - deepspeed
+  - moe
+  - gemm
+  from:
+  - deepspeed
+  kind:
+  - MoE
+  stages:
+  - beta: '0.0.0'
+- id: multi_tensor_lion
+  file: lion
+  description: Fused Lion optimizer update over multiple parameter tensors.
+  for:
+  - multi_tensor_lion
+  labels:
+  - deepspeed
+  - optimizer
+  from:
+  - deepspeed
+  kind:
+  - Optimizer
+  source: deepspeed.ops.op_builder.FusedLionBuilder
+  stages:
+  - beta: '0.0.0'
+- id: packbits
+  description: Packs floating-point values into uint8 bit-fields along a dimension.
+  for:
+  - packbits
+  labels:
+  - deepspeed
+  - tensor
+  from:
+  - deepspeed
+  kind:
+  - Tensor
+  stages:
+  - beta: '0.0.0'
+- id: quick_gelu
+  description: 'QuickGELU activation: x * sigmoid(1.702 * x).'
+  for:
+  - quick_gelu
+  labels:
+  - megatron
+  - activation
+  from:
+  - megatron
+  kind:
+  - Activation
+  source: megatron.core.activations
+  stages:
+  - beta: '0.0.0'
+- id: unpackbits
+  description: Unpacks uint8 bit-fields into floating-point values along a dimension.
+  for:
+  - unpackbits
+  labels:
+  - deepspeed
+  - tensor
+  from:
+  - deepspeed
+  kind:
+  - Tensor
+  stages:
+  - beta: '0.0.0'
+- id: wf6af16_linear
+  description: Linear layer with FP6-E3M2 weights and FP16 activations.
+  for:
+  - cuda_wf6af16_linear
+  labels:
+  - deepspeed
+  - quantization
+  - linear
+  from:
+  - deepspeed
+  kind:
+  - Quantization
+  source: deepspeed.ops.op_builder.InferenceCoreBuilder
+  stages:
+  - beta: '0.0.0'
