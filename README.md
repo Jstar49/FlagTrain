@@ -10,7 +10,54 @@ FlagTrain is a library of training operators and compute components implemented 
 
 For training framework developers, FlagTrain aims to provide Triton implementations aligned with the relevant interfaces and computational semantics, reducing repeated development and hardware adaptation work. For operator developers, FlagTrain provides a collaborative platform for organizing implementations, tests, and performance optimization around real training workloads.
 
-The project is in its initial development stage. The repository contains documentation and a component directory skeleton; no operator implementations are available yet, and component and hardware compatibility have not been validated.
+The project is under active development: documentation and component implementations are added incrementally, and component and hardware compatibility have not been fully validated.
+
+## Installation
+
+FlagTrain does not publish or maintain its own container images. The shared FlagOS
+software stack is built by
+[flagos-ai/build-infra](https://github.com/flagos-ai/build-infra) from its
+[`configs.yaml`](https://github.com/flagos-ai/build-infra/blob/main/configs.yaml).
+Use the public Megatron application image (`megatron_training`), which is the
+FlagOS runtime image plus `megatron-core`:
+
+| Backend | Image |
+| --- | --- |
+| `nvidia-cuda133` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-generic-13.3:2.2.0-0.2.3` |
+| `ascend-cann900` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-ascend-cann9.0.0:2.2.0-0.2.3` |
+| `hygon` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-hygon-dtk26.04:2.2.0-0.2.3` |
+| `iluvatar` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-iluvatar-corex4.5.0:2.2.0-0.2.3` |
+| `metax-maca3810` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-metax-maca3.8.1.3:2.2.0-0.2.3` |
+| `mthreads-musa520` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-mthreads-musa5.2.0:2.2.0-0.2.3` |
+| `thead` | No Megatron app image; use the vendor image and `tools/setup_env.sh thead --no-prebuilt` |
+
+Image names and tags are owned by build-infra. The table reflects the
+`2.2.0-0.2.3` release; the current catalog is at
+<https://flagos-ai.github.io/release-info/>.
+
+Inside the image, only FlagTrain's own dependencies need installing:
+
+```bash
+python -m pip install -e .           # runtime
+python -m pip install -e ".[test]"   # development and tests
+```
+
+On the FlagOS network, set `PIP_INDEX_URL` to the mirror before installing (the
+image's pip does not persist one); see [docs/installation.md](docs/installation.md).
+
+Vendor extras install the stack pinned in `backends.yaml` and are intended for
+environments without a FlagOS image:
+
+```bash
+python -m pip install -e ".[metax]"        # MetaX
+python -m pip install -e ".[test,nvidia]"  # NVIDIA + tests
+```
+
+The image already provides torch, numpy, flagtree and megatron-core, so the
+vendor extra is not needed there; if the two disagree, the image wins. See
+[docs/installation.md](docs/installation.md) for the full image and extra
+tables, package indexes, and how the extras are kept in sync with
+`backends.yaml`.
 
 ## Design Goals
 
