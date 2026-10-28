@@ -10,12 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-# Dependencies needed by both using and developing FlagTrain, and available
-# from a plain PyPI index. torch and the Triton-family compiler are
-# deliberately not listed here: they are vendor-specific wheels owned by the
-# FlagOS base images (build-infra) and by the backend extras below, and
-# declaring a generic `triton` would shadow the `flagtree` package that
-# provides the triton module on these platforms.
+
 dependencies = [
     "numpy",
     "packaging>=23.0",
