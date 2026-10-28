@@ -30,85 +30,17 @@ Issues = "https://github.com/flagos-ai/FlagTrain/issues"
 
 [project.optional-dependencies]
 # --- BEGIN auto-generated from backends.yaml ---
-ascend = [
-    "torch==2.10.0+cpu",
-    "torch-npu==2.10.0",
-    "cann-shmem==1.6.0",
-    "decorator==5.1.1",
-    "attrs==24.2.0",
-    "psutil==6.0.0",
-    "numpy==1.26.4",
-    "megatron-core==0.17.1",
-    "flagtree==0.7.0+ascend3.5",
-]
-
-hygon = [
-    "torch==2.9.0+das.opt1.dtk2604",
-    "flash_attn==2.8.3+das.opt1.dtk2604.torch290",
-    "megatron-core==0.17.1",
-    "flagtree==0.7.0+hcu3.6",
-]
-
-iluvatar = [
-    "torch==2.10.0+corex.4.5.0.20260804",
-    "torchaudio==2.10.0+corex.4.5.0.20260804",
-    "torchvision==0.25.0+corex.4.5.0.20260804",
-    "numpy<2",
-    "megatron-core==0.19.2",
-    "flagtree==0.7.0+iluvatar3.6",
-]
-
-metax = [
-    "apex==0.1+metax3.8.1.0",
-    "flash_attn==2.6.3+metax3.8.1.0torch2.10",
-    "flashinfer==0.2.6+metax3.8.1.0torch2.10",
-    "flash_linear_attention==0.5.0+metax3.8.1.0torch2.10",
-    "flash_mla==1.0.1+metax3.8.1.0torch2.10",
-    "numpy==2.3.5",
-    "torch==2.10.0+metax3.8.1.0",
-    "torchcodec==0.6.0+metax3.8.1.0",
-    "torchaudio==2.4.1+metax3.8.1.0",
-    "torchvision==0.25.0+metax3.8.1.0",
-    "megatron-core==0.19.2",
-    "flagtree==0.7.0+metax3.6",
-]
-
-mthreads = [
-    "torch==2.9.1+musa5.2.0",
-    "torch_musa==2.9.1",
-    "mkl==2024.0.0",
-    "flagtree==0.7.0+mthreads3.6",
-]
 
 nvidia = [
-    "torch==2.11.0+cu130",
-    "torchaudio==2.11.0+cu130",
-    "torchvision==0.26.0+cu130",
-    "deepspeed==0.19.7",
+    "deepspeed==0.19.8",
     "deepspeed-kernels",
-    "nvidia-cutlass==3.8.0.0",
-    "nvidia-resiliency-ext==0.6.0",
-    "megatron-core==0.19.2",
-    "flagtree==0.7.0",
 ]
 
-thead = [
-    "torch==2.10.0+v0.1.0.ppu2.1.1",
-    "megatron-core==0.17.1",
-    "flagtree==0.7.0+ppu3.6",
-]
+
 # --- END auto-generated from backends.yaml ---
 
 test = [
     "pytest>=8.0",
-    "deepspeed==0.19.7",
-    # NVIDIA's blocked_flash tests use the libblockedflash that ships in this
-    # package. It installs on any x86_64 host; only the NVIDIA tests import it.
-    "deepspeed-kernels",
-    # Floor, not the CI pin: the Megatron app image ships 0.17.1, while
-    # backends.yaml pins 0.19.2 on some vendors. Raising the floor lets the
-    # image satisfy the extra without downgrading its megatron-core.
-    "megatron-core>=0.17.1",
 ]
 
 [tool.setuptools.packages.find]

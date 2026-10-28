@@ -23,13 +23,7 @@ FlagOS runtime image plus `megatron-core`:
 
 | Backend | Image |
 | --- | --- |
-| `nvidia-cuda133` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-generic-13.3:2.2.0-0.2.3` |
-| `ascend-cann900` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-ascend-cann9.0.0:2.2.0-0.2.3` |
-| `hygon` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-hygon-dtk26.04:2.2.0-0.2.3` |
-| `iluvatar` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-iluvatar-corex4.5.0:2.2.0-0.2.3` |
-| `metax-maca3810` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-metax-maca3.8.1.3:2.2.0-0.2.3` |
-| `mthreads-musa520` | `harbor.baai.ac.cn/flagos-app/megatron_training0.17.1-mthreads-musa5.2.0:2.2.0-0.2.3` |
-| `thead` | No Megatron app image; use the vendor image and `tools/setup_env.sh thead --no-prebuilt` |
+| `nvidia-cuda133` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-generic-13.3:2.2.0-0.2.3` |
 
 Image names and tags are owned by build-infra. The table reflects the
 `2.2.0-0.2.3` release; the current catalog is at
