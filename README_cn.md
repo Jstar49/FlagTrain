@@ -10,7 +10,44 @@ FlagTrain 是一个基于 [Triton](https://github.com/triton-lang/triton) 语言
 
 对于训练框架开发者，FlagTrain 致力于提供符合相应接口和计算语义的 Triton 实现，减少重复开发与硬件适配工作；对于算子开发者，FlagTrain 提供围绕实际训练场景组织实现、测试和性能优化的协作平台。
 
-项目目前处于初期建设阶段，仓库已建立文档与组件目录骨架，尚未提供算子实现或完成组件及硬件兼容性验证。
+项目处于持续建设阶段，文档与组件实现会逐步补充；组件及硬件兼容性尚未完成全面验证。
+
+## 安装
+
+FlagTrain 不发布也不维护自己的容器镜像。公共 FlagOS 软件栈由
+[flagos-ai/build-infra](https://github.com/flagos-ai/build-infra) 根据其
+[`configs.yaml`](https://github.com/flagos-ai/build-infra/blob/main/configs.yaml)
+统一构建。推荐直接使用公共的 Megatron app 镜像（`megatron_training`），它由
+FlagOS runtime 镜像加上 `megatron-core` 构成：
+
+| 后端 | 镜像 |
+| --- | --- |
+| `nvidia-cuda133` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-generic-13.3:2.2.0-0.2.3` |
+
+镜像名和 tag 由 build-infra 维护。上表对应 `2.2.0-0.2.3` 发布，最新列表见
+<https://flagos-ai.github.io/release-info/>。
+
+在镜像内只需安装 FlagTrain 自身依赖：
+
+```bash
+python -m pip install -e .           # 使用
+python -m pip install -e ".[test]"   # 开发与测试
+```
+
+FlagOS 网络内安装前需把 `PIP_INDEX_URL` 指向镜像源（镜像内的 pip 没有持久化该
+配置），详见[安装说明](docs/installation.md)。
+
+厂商分组按 `backends.yaml` 安装对应厂商的软件栈，适用于没有使用 FlagOS 镜像的
+环境：
+
+```bash
+python -m pip install -e ".[metax]"        # 沐曦
+python -m pip install -e ".[test,nvidia]"  # NVIDIA + 测试依赖
+```
+
+镜像已经提供 torch、numpy、flagtree 和 megatron-core，不需要再安装厂商分组；
+两者版本不一致时以镜像为准。镜像与分组列表、包索引及依赖同步方式见
+[安装说明](docs/installation.md)。
 
 ## 设计目标
 
