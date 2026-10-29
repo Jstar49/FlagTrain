@@ -99,6 +99,36 @@ ops:
   source: megatron.core.transformer.hyper_connection
   stages:
   - beta: '0.0.0'
+- id: fused_proj_rms_compute_h_backward
+  description: Gradients of fused_proj_rms_compute_h_forward with respect to x, weight, the gating factors and bias.
+  for:
+  - fused_proj_rms_compute_h_backward
+  labels:
+  - megatron
+  - linear
+  - normalization
+  from:
+  - megatron
+  kind:
+  - Normalization
+  source: megatron.core.fusions.fused_mhc_kernels
+  stages:
+  - beta: '0.0.0'
+- id: fused_proj_rms_compute_h_forward
+  description: Fused projection, RMS scale, and the mHC H_pre / H_post / H_res mapping outputs.
+  for:
+  - fused_proj_rms_compute_h_forward
+  labels:
+  - megatron
+  - linear
+  - normalization
+  from:
+  - megatron
+  kind:
+  - Normalization
+  source: megatron.core.fusions.fused_mhc_kernels
+  stages:
+  - beta: '0.0.0'
 - id: fused_proj_rms_forward
   description: Fused projection (x @ weight^T) and RMS scale 1 / (||x|| / sqrt(K) + eps).
   for:
