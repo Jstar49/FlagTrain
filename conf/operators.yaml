@@ -42,6 +42,20 @@ ops:
   source: deepspeed.ops.deepspeed4science
   stages:
   - beta: '0.0.0'
+- id: fast_gelu
+  description: 'FastGELU activation: 0.5 * x * (1 + tanh(0.7978845608 * x * (1 + 0.044715 * x * x))).'
+  for:
+  - fast_gelu
+  labels:
+  - megatron
+  - activation
+  from:
+  - megatron
+  kind:
+  - Activation
+  source: megatron.core.activations
+  stages:
+  - beta: '0.0.0'
 - id: fused_indices_to_multihot
   description: Converts fused expert indices and routing probabilities into a multi-hot mask.
   for:
