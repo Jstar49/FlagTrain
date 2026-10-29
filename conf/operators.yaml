@@ -70,6 +70,36 @@ ops:
   source: megatron.core.fusions.fused_pad_routing_map
   stages:
   - beta: '0.0.0'
+- id: fused_proj_rms_backward
+  description: Gradients of fused_proj_rms_forward with respect to x and weight.
+  for:
+  - fused_proj_rms_backward
+  labels:
+  - megatron
+  - linear
+  - normalization
+  from:
+  - megatron
+  kind:
+  - Normalization
+  source: megatron.core.transformer.hyper_connection
+  stages:
+  - beta: '0.0.0'
+- id: fused_proj_rms_forward
+  description: Fused projection (x @ weight^T) and RMS scale 1 / (||x|| / sqrt(K) + eps).
+  for:
+  - fused_proj_rms_forward
+  labels:
+  - megatron
+  - linear
+  - normalization
+  from:
+  - megatron
+  kind:
+  - Normalization
+  source: megatron.core.transformer.hyper_connection
+  stages:
+  - beta: '0.0.0'
 - id: lamb
   description: Fused LAMB optimizer update.
   for:
