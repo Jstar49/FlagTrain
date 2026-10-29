@@ -142,6 +142,20 @@ ops:
   - MoE
   stages:
   - beta: '0.0.0'
+- id: multi_tensor_adam
+  description: Fused Adam/AdamW optimizer update over multiple parameter tensors.
+  for:
+  - multi_tensor_adam
+  labels:
+  - deepspeed
+  - optimizer
+  from:
+  - deepspeed
+  kind:
+  - Optimizer
+  source: deepspeed.ops.op_builder.FusedAdamBuilder
+  stages:
+  - beta: '0.0.0'
 - id: multi_tensor_lion
   file: lion
   description: Fused Lion optimizer update over multiple parameter tensors.
