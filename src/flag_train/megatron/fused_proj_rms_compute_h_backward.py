@@ -13,7 +13,7 @@
 # limitations under the License.
 """Backward of Megatron's fused projection + RMS + compute_h mHC mapping.
 
-Forward (``fused_proj_rms_compute_h_fwd``) returns ``h_pre``, ``h_post``,
+Forward (``fused_proj_rms_compute_h_forward``) returns ``h_pre``, ``h_post``,
 ``h_res``, ``r`` and the reduced ``proj``. With upstream gradients
 ``grad_h_pre``, ``grad_h_post``, ``grad_h_res`` and optionally ``grad_r``::
 
@@ -71,7 +71,7 @@ _SHARED_MEMORY_BUDGET = 128 * 1024
 _TARGET_GRAD_WEIGHT_PROGRAMS = 128
 
 _MIN_BLOCK_N = 16
-_BWD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_BACKWARD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def _check_input(tensor, name, dtypes=None):
@@ -105,7 +105,7 @@ def _check_matrix(tensor, name, shape=None):
 
 
 def _check_scalar(tensor, name):
-    _check_input(tensor, name, _BWD_DTYPES)
+    _check_input(tensor, name, _BACKWARD_DTYPES)
     if tensor.numel() != 1:
         raise ValueError(f"{name} needs one element, got shape {tuple(tensor.shape)}")
 
@@ -460,7 +460,7 @@ def _grad_weight_split(K, block_k):
     return max(1, min(8, triton.cdiv(_TARGET_GRAD_WEIGHT_PROGRAMS, k_tiles)))
 
 
-def fused_proj_rms_compute_h_bwd(
+def fused_proj_rms_compute_h_backward(
     x,
     weight,
     grad_h_pre,
@@ -507,7 +507,7 @@ def fused_proj_rms_compute_h_bwd(
         ``grad_alpha_pre`` / ``grad_alpha_post`` / ``grad_alpha_res`` (one
         element each) and ``grad_bias`` ``[N]``, in the dtypes of the inputs.
     """
-    logger.debug("TRAIN FUSED_PROJ_RMS_COMPUTE_H_BWD")
+    logger.debug("TRAIN FUSED_PROJ_RMS_COMPUTE_H_BACKWARD")
 
     _check_matrix(x, "x")
     _check_matrix(weight, "weight")
@@ -553,7 +553,7 @@ def fused_proj_rms_compute_h_bwd(
             raise ValueError(
                 f"grad_r_ext needs {M} elements, got shape {tuple(grad_r_ext.shape)}"
             )
-        _check_input(grad_r_ext, "grad_r_ext", _BWD_DTYPES)
+        _check_input(grad_r_ext, "grad_r_ext", _BACKWARD_DTYPES)
         if not grad_r_ext.is_contiguous():
             raise ValueError(
                 "grad_r_ext needs a contiguous tensor; call .contiguous() on the argument"

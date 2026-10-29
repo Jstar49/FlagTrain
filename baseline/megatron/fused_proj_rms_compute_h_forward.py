@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NVIDIA baseline for fused_proj_rms_compute_h_fwd (forward).
+"""NVIDIA baseline for fused_proj_rms_compute_h_forward (forward).
 
 Self-contained module; depends only on torch and megatron. ``native()`` returns
 Megatron-LM's ``megatron.core.fusions.fused_mhc_kernels.fused_proj_rms_compute_h``
@@ -27,19 +27,19 @@ FlagTrain's operator also returns the reduced projection for its backward, but
 the collector records latency and NCU metrics rather than comparing values.
 
 Shapes, dtypes and the input construction are copied from
-``FlagTrain/benchmark/megatron/test_fused_proj_rms_compute_h_fwd.py``: mHC's
+``FlagTrain/benchmark/megatron/test_fused_proj_rms_compute_h_forward.py``: mHC's
 real configuration, low-precision activations with the mapping parameters
 (weight, alphas, bias) kept in fp32.
 """
 
 import torch
 
-OP_NAME = "fused_proj_rms_compute_h_fwd"
-# benchmark/megatron/test_fused_proj_rms_compute_h_fwd.py::_ACTIVATION_DTYPES
+OP_NAME = "fused_proj_rms_compute_h_forward"
+# benchmark/megatron/test_fused_proj_rms_compute_h_forward.py::_ACTIVATION_DTYPES
 DTYPES = [torch.float16, torch.bfloat16]
 IS_INPLACE = False
 
-# benchmark/megatron/test_fused_proj_rms_compute_h_fwd.py::_SHAPES
+# benchmark/megatron/test_fused_proj_rms_compute_h_forward.py::_SHAPES
 _SHAPES = [
     (1024, 4, 16384),
     (4096, 4, 16384),
@@ -65,7 +65,7 @@ def base_op():
         kernel = fused_mhc_kernels.fused_proj_rms_compute_h
     except Exception as exc:
         raise RuntimeError(
-            "fused_proj_rms_compute_h_fwd baseline requires Megatron-LM's "
+            "fused_proj_rms_compute_h_forward baseline requires Megatron-LM's "
             "megatron.core.fusions.fused_mhc_kernels, which could not be "
             f"imported: {exc!r}. Install a Megatron-LM build that ships this "
             "module (megatron-core 0.19.2 does not)."
@@ -92,7 +92,7 @@ def grid():
 
 
 def build_inputs(binding, dtype, device):
-    """Mirror FlagTrain/benchmark/megatron/test_fused_proj_rms_compute_h_fwd.py."""
+    """Mirror FlagTrain/benchmark/megatron/test_fused_proj_rms_compute_h_forward.py."""
     M, n, K = binding["shape"]
     N = n * n + 2 * n
     torch.manual_seed(0)

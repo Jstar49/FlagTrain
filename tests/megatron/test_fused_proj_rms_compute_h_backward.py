@@ -23,7 +23,7 @@ float64 inputs.
 
 Run with::
 
-    pytest -m fused_proj_rms_compute_h_bwd tests/megatron -vs
+    pytest -m fused_proj_rms_compute_h_backward tests/megatron -vs
 """
 
 import math
@@ -32,7 +32,7 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import fused_proj_rms_compute_h_bwd
+from flag_train.megatron import fused_proj_rms_compute_h_backward
 
 from .. import accuracy_utils as utils
 
@@ -229,7 +229,7 @@ def _run(M, n, K, x_dtype, weight_dtype, aux_dtype, grads, with_r, seed=0):
     if not with_r:
         gy_r = None
 
-    got = fused_proj_rms_compute_h_bwd(
+    got = fused_proj_rms_compute_h_backward(
         x,
         weight,
         gy_pre,
@@ -267,7 +267,7 @@ def _run(M, n, K, x_dtype, weight_dtype, aux_dtype, grads, with_r, seed=0):
 
 @pytest.mark.parametrize("M,n,K", _CASES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_bwd_vs_reference(M, n, K, dtype):
+def test_backward_vs_reference(M, n, K, dtype):
     """Catch wrong activation derivatives, segment layout, RMS term, or reductions."""
     if dtype == torch.bfloat16 and not utils.bf16_is_supported:
         pytest.skip("bfloat16 is not supported on this device")
@@ -275,7 +275,7 @@ def test_bwd_vs_reference(M, n, K, dtype):
 
 
 @pytest.mark.parametrize("M,n,K", [(33, 4, 2048), (64, 2, 512)])
-def test_bwd_activation_dtype_with_fp32_weight(M, n, K):
+def test_backward_activation_dtype_with_fp32_weight(M, n, K):
     """mHC's real case: bf16 activations with keep_in_fp32 mapping parameters."""
     x_dtype = torch.bfloat16 if utils.bf16_is_supported else torch.float16
     _run(M, n, K, x_dtype, torch.float32, torch.float32, (True, True, True), True)
@@ -289,12 +289,12 @@ def test_bwd_activation_dtype_with_fp32_weight(M, n, K):
         ((False, True, False), False),
     ],
 )
-def test_bwd_partial_grads(grads, with_r):
+def test_backward_partial_grads(grads, with_r):
     """Catch treating an unused forward output as a zero gradient."""
     _run(64, 4, 512, torch.float32, torch.float32, torch.float32, grads, with_r)
 
 
-def test_bwd_rejects_bad_arguments():
+def test_backward_rejects_bad_arguments():
     """Catch silent wrong layouts and mis-sized saved tensors before launching."""
     x, weight, alpha_pre, alpha_post, alpha_res, bias = _inputs(
         8, 4, 256, torch.float32, torch.float32
@@ -329,7 +329,7 @@ def test_bwd_rejects_bad_arguments():
             "n": 4,
         }
         kwargs.update(overrides)
-        return fused_proj_rms_compute_h_bwd(**kwargs)
+        return fused_proj_rms_compute_h_backward(**kwargs)
 
     with pytest.raises(ValueError, match="contiguous"):
         call(x=x.t())

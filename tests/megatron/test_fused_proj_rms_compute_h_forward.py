@@ -24,7 +24,7 @@ magnitudes stay well-conditioned.
 
 Run with::
 
-    pytest -m fused_proj_rms_compute_h_fwd tests/megatron -vs
+    pytest -m fused_proj_rms_compute_h_forward tests/megatron -vs
 """
 
 import math
@@ -152,10 +152,10 @@ def _check(got, expected, dtype):
     utils.train_assert_close(got, expected, dtype, atol=_ATOL[dtype])
 
 
-@pytest.mark.fused_proj_rms_compute_h_fwd
+@pytest.mark.fused_proj_rms_compute_h_forward
 @pytest.mark.parametrize("M,n,K", _CASES)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_fwd_vs_reference(M, n, K, dtype):
+def test_forward_vs_reference(M, n, K, dtype):
     """Catch wrong segment layout, RMS scale, eps placement, bias, or masking."""
     if dtype == torch.bfloat16 and not utils.bf16_is_supported:
         pytest.skip("bfloat16 is not supported on this device")
@@ -167,7 +167,7 @@ def test_fwd_vs_reference(M, n, K, dtype):
     expected = _reference(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, n, 1e-6, 1e-6
     )
-    got = flag_train.megatron.fused_proj_rms_compute_h_fwd(
+    got = flag_train.megatron.fused_proj_rms_compute_h_forward(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, n
     )
     # Megatron's forward returns four tensors; `proj` is our backward extra.
@@ -175,9 +175,9 @@ def test_fwd_vs_reference(M, n, K, dtype):
         _check(result, ref, dtype)
 
 
-@pytest.mark.fused_proj_rms_compute_h_fwd
+@pytest.mark.fused_proj_rms_compute_h_forward
 @pytest.mark.parametrize("M,n,K", [(33, 4, 2048), (64, 2, 512)])
-def test_fwd_activation_dtype_with_fp32_weight(M, n, K):
+def test_forward_activation_dtype_with_fp32_weight(M, n, K):
     """mHC's real case: bf16 activations with keep_in_fp32 mapping parameters."""
     x_dtype = torch.bfloat16 if utils.bf16_is_supported else torch.float16
     x, weight, alpha_pre, alpha_post, alpha_res, bias = _inputs(
@@ -186,7 +186,7 @@ def test_fwd_activation_dtype_with_fp32_weight(M, n, K):
     expected = _reference(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, n, 1e-6, 1e-6
     )
-    got = flag_train.megatron.fused_proj_rms_compute_h_fwd(
+    got = flag_train.megatron.fused_proj_rms_compute_h_forward(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, n
     )
     # promote_types(activation, fp32) makes every output fp32.
@@ -195,8 +195,8 @@ def test_fwd_activation_dtype_with_fp32_weight(M, n, K):
         _check(result, ref, torch.float32)
 
 
-@pytest.mark.fused_proj_rms_compute_h_fwd
-def test_fwd_eps_arguments():
+@pytest.mark.fused_proj_rms_compute_h_forward
+def test_forward_eps_arguments():
     """Distinct eps values must reach both the RMS denominator and h_pre."""
     x, weight, alpha_pre, alpha_post, alpha_res, bias = _inputs(
         64, 4, 512, torch.float32, torch.float32
@@ -205,7 +205,7 @@ def test_fwd_eps_arguments():
     expected = _reference(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, 4, eps, compute_h_eps
     )
-    got = flag_train.megatron.fused_proj_rms_compute_h_fwd(
+    got = flag_train.megatron.fused_proj_rms_compute_h_forward(
         x, weight, alpha_pre, alpha_post, alpha_res, bias, 4, eps, compute_h_eps
     )
     # Megatron's forward returns four tensors; `proj` is our backward extra.
@@ -213,25 +213,25 @@ def test_fwd_eps_arguments():
         _check(result, ref, torch.float32)
 
 
-@pytest.mark.fused_proj_rms_compute_h_fwd
-def test_fwd_rejects_bad_arguments():
+@pytest.mark.fused_proj_rms_compute_h_forward
+def test_forward_rejects_bad_arguments():
     """Catch silent wrong layouts and mis-sized parameters before launching."""
     x, weight, alpha_pre, alpha_post, alpha_res, bias = _inputs(
         8, 4, 256, torch.float32, torch.float32
     )
     with pytest.raises(ValueError, match="contiguous"):
-        flag_train.megatron.fused_proj_rms_compute_h_fwd(
+        flag_train.megatron.fused_proj_rms_compute_h_forward(
             x.t(), weight, alpha_pre, alpha_post, alpha_res, bias, 4
         )
     with pytest.raises(ValueError, match="n \\* n \\+ 2 \\* n"):
-        flag_train.megatron.fused_proj_rms_compute_h_fwd(
+        flag_train.megatron.fused_proj_rms_compute_h_forward(
             x, weight, alpha_pre, alpha_post, alpha_res, bias, 3
         )
     with pytest.raises(ValueError, match="bias"):
-        flag_train.megatron.fused_proj_rms_compute_h_fwd(
+        flag_train.megatron.fused_proj_rms_compute_h_forward(
             x, weight, alpha_pre, alpha_post, alpha_res, bias[:-1], 4
         )
     with pytest.raises(ValueError, match="positive"):
-        flag_train.megatron.fused_proj_rms_compute_h_fwd(
+        flag_train.megatron.fused_proj_rms_compute_h_forward(
             x, weight, alpha_pre, alpha_post, alpha_res, bias, 0
         )

@@ -28,14 +28,14 @@ speedup includes that difference (the same caveat as the forward benchmark).
 
 Run::
 
-    pytest benchmark/megatron -m fused_proj_rms_compute_h_bwd --level core
+    pytest benchmark/megatron -m fused_proj_rms_compute_h_backward --level core
 """
 
 import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import fused_proj_rms_compute_h_fwd
+from flag_train.megatron import fused_proj_rms_compute_h_forward
 
 from .. import base, consts
 
@@ -130,7 +130,7 @@ def _input_fn(shape, dtype, device):
     weight = torch.empty(N, K, dtype=_WEIGHT_DTYPE, device=device).uniform_(-0.1, 0.1)
     alpha = torch.full((1,), 0.01, dtype=torch.float32, device=device)
     bias = torch.zeros(N, dtype=torch.float32, device=device)
-    h_pre, h_post, h_res, r, proj = fused_proj_rms_compute_h_fwd(
+    h_pre, h_post, h_res, r, proj = fused_proj_rms_compute_h_forward(
         x, weight, alpha, alpha, alpha, bias, n
     )
 
@@ -166,7 +166,7 @@ def _input_fn(shape, dtype, device):
     # One untimed correctness check per shape so both sides answer the same
     # question (the backward matmuls use tf32 for fp32 operands).
     expected = torch_op(*args)
-    got = flag_train.megatron.fused_proj_rms_compute_h_bwd(*args)
+    got = flag_train.megatron.fused_proj_rms_compute_h_backward(*args)
     tolerance = _TOLERANCE[dtype]
     for name, result, ref in zip(
         (
@@ -233,16 +233,16 @@ class ProjRmsComputeHBwdBenchmark(base.GenericBenchmark):
         return (read_bytes + write_bytes) * 1e-9 / (latency * 1e-3)
 
 
-@pytest.mark.fused_proj_rms_compute_h_bwd(
+@pytest.mark.fused_proj_rms_compute_h_backward(
     recommended_shapes=_SHAPES, shape_desc="M, n, K"
 )
-def test_fused_proj_rms_compute_h_bwd_perf():
+def test_fused_proj_rms_compute_h_backward_perf():
     """mHC's real case: bf16 activations with a keep_in_fp32 weight."""
     bench = ProjRmsComputeHBwdBenchmark(
         input_fn=_input_fn,
-        op_name="fused_proj_rms_compute_h_bwd",
+        op_name="fused_proj_rms_compute_h_backward",
         torch_op=torch_op,
         dtypes=_ACTIVATION_DTYPES,
     )
-    bench.set_train(flag_train.megatron.fused_proj_rms_compute_h_bwd)
+    bench.set_train(flag_train.megatron.fused_proj_rms_compute_h_backward)
     bench.run()

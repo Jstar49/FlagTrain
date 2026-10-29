@@ -31,7 +31,7 @@ cuTile kernel available both sides use tf32.
 
 Run::
 
-    pytest benchmark/megatron -m fused_proj_rms_compute_h_fwd --level core
+    pytest benchmark/megatron -m fused_proj_rms_compute_h_forward --level core
 """
 
 import math
@@ -131,7 +131,7 @@ def _input_fn(shape, dtype, device):
     # question (the operator's fp32 dot is tf32; see the module docstring).
     # Megatron's forward returns four tensors; `proj` is our backward extra.
     expected = torch_op(*args)
-    got = flag_train.megatron.fused_proj_rms_compute_h_fwd(*args)
+    got = flag_train.megatron.fused_proj_rms_compute_h_forward(*args)
     tolerance = _TOLERANCE[dtype]
     for name, result, ref in zip(("h_pre", "h_post", "h_res", "r"), got[:4], expected):
         torch.testing.assert_close(
@@ -173,16 +173,16 @@ class ProjRmsComputeHBenchmark(base.GenericBenchmark):
         return (read_bytes + write_bytes) * 1e-9 / (latency * 1e-3)
 
 
-@pytest.mark.fused_proj_rms_compute_h_fwd(
+@pytest.mark.fused_proj_rms_compute_h_forward(
     recommended_shapes=_SHAPES, shape_desc="M, n, K"
 )
-def test_fused_proj_rms_compute_h_fwd_perf():
+def test_fused_proj_rms_compute_h_forward_perf():
     """mHC's real case: low-precision activations with a keep_in_fp32 weight."""
     bench = ProjRmsComputeHBenchmark(
         input_fn=_input_fn,
-        op_name="fused_proj_rms_compute_h_fwd",
+        op_name="fused_proj_rms_compute_h_forward",
         torch_op=torch_op,
         dtypes=_ACTIVATION_DTYPES,
     )
-    bench.set_train(flag_train.megatron.fused_proj_rms_compute_h_fwd)
+    bench.set_train(flag_train.megatron.fused_proj_rms_compute_h_forward)
     bench.run()

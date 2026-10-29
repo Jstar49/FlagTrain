@@ -105,7 +105,7 @@ _SHARED_MEMORY_BUDGET = 128 * 1024
 
 _MIN_BLOCK_N = 16
 
-_FWD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_FORWARD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def _check_input(tensor, name, dtypes):
@@ -335,7 +335,7 @@ def _proj_config(M, N, K, x_itemsize, weight_itemsize):
     return block_m, block_n, block_k, stages
 
 
-def fused_proj_rms_compute_h_fwd(
+def fused_proj_rms_compute_h_forward(
     x,
     weight,
     alpha_pre,
@@ -369,17 +369,17 @@ def fused_proj_rms_compute_h_fwd(
     ``_cutile_proj_rms_compute_h_fwd``, which its ``torch.autograd.Function``
     calls.
     """
-    logger.debug("TRAIN FUSED_PROJ_RMS_COMPUTE_H_FWD")
+    logger.debug("TRAIN FUSED_PROJ_RMS_COMPUTE_H_FORWARD")
 
-    _check_matrix(x, "x", _FWD_DTYPES)
-    _check_matrix(weight, "weight", _FWD_DTYPES)
-    _check_input(bias, "bias", _FWD_DTYPES)
+    _check_matrix(x, "x", _FORWARD_DTYPES)
+    _check_matrix(weight, "weight", _FORWARD_DTYPES)
+    _check_input(bias, "bias", _FORWARD_DTYPES)
     for name, tensor in (
         ("alpha_pre", alpha_pre),
         ("alpha_post", alpha_post),
         ("alpha_res", alpha_res),
     ):
-        _check_scalar(tensor, name, _FWD_DTYPES)
+        _check_scalar(tensor, name, _FORWARD_DTYPES)
     if isinstance(n, bool) or not isinstance(n, int):
         raise TypeError(f"n needs an int, got {type(n).__name__}")
     if n <= 0:
