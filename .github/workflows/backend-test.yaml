@@ -52,7 +52,10 @@
 # baseline matched (otherwise the local torch-baseline speedup), and the tool
 # writes per-dtype/op summaries (summary.json/csv/md) that are uploaded with
 # the accuracy report. --base-data is optional: a missing baseline disables
-# the "vs Base" column without failing the run.
+# the "vs Base" column without failing the run. A benchmark whose baseline is
+# the upstream implementation (native_baseline) ignores --base-data outright:
+# the local ratio is already a real comparison, so its rows carry no
+# compared_speedup and the summary reports the Train Speedup.
 #
 # No shape uses a secret: a fork's PR builds and tests exactly like a branch
 # here.

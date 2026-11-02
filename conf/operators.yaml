@@ -13,6 +13,21 @@
 # limitations under the License.
 
 ops:
+- id: bias_swiglu_impl
+  description: 'Bias plus SwiGLU fusion: bias add, gate/linear split, and SwiGLU in one
+    kernel. Forward only; the clamped and SiTU-GLU variants are selected by arguments.'
+  for:
+  - bias_swiglu_impl
+  labels:
+  - megatron
+  - activation
+  from:
+  - megatron
+  kind:
+  - Activation
+  source: megatron.core.fusions.fused_bias_swiglu
+  stages:
+  - beta: '0.0.0'
 - id: blocked_flash
   description: Blocked flash attention over paged KV-cache blocks.
   for:
@@ -170,6 +185,20 @@ ops:
   - deepspeed
   kind:
   - MoE
+  stages:
+  - beta: '0.0.0'
+- id: multi_tensor_adam
+  description: Fused Adam/AdamW optimizer update over multiple parameter tensors.
+  for:
+  - multi_tensor_adam
+  labels:
+  - deepspeed
+  - optimizer
+  from:
+  - deepspeed
+  kind:
+  - Optimizer
+  source: deepspeed.ops.op_builder.FusedAdamBuilder
   stages:
   - beta: '0.0.0'
 - id: multi_tensor_lion

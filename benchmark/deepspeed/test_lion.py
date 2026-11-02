@@ -202,6 +202,9 @@ def test_lion_perf():
         op_name="multi_tensor_lion",
         torch_op=torch_op,
         dtypes=[torch.float32, torch.float16, torch.bfloat16],
+        # The local ratio is a real comparison when the baseline is DeepSpeed's
+        # kernel, so --base-data's cross-hardware figure does not apply.
+        native_baseline=_deepspeed_lion is not None,
     )
     bench.set_train(train_op)
     bench.run()

@@ -18,7 +18,9 @@ Mirrors FlagGems-vllm's tools/run_tests.py::parse_perf_data and
 tools/psum_text::parse_lines:
 
   * per shape: ``compared_speedup`` when present (the vs-Base value), else the
-    local torch-baseline ``speedup``;
+    local torch-baseline ``speedup``. An operator whose benchmark declares a
+    native baseline (``base_data_ignored`` in its JSON) never carries
+    ``compared_speedup``, so it is summarized by the local ``speedup``;
   * per dtype: arithmetic mean over shapes that carry a numeric value
     (``None`` is excluded, ``0.0`` is kept);
   * per op: arithmetic mean over dtypes that carry a value.
@@ -95,6 +97,7 @@ def parse_benchmark_data(raw: dict) -> dict:
                 "perf_avg": None,
                 "base_miss_reasons": [],
                 "base_data_used": False,
+                "base_data_ignored": False,
                 "matched_shapes": None,
                 "missed_shapes": None,
             }
@@ -106,11 +109,14 @@ def parse_benchmark_data(raw: dict) -> dict:
         matched = 0
         missed = 0
         base_data_used = False
+        base_data_ignored = False
 
         for detail in bucket.get("details") or []:
             if not isinstance(detail, dict):
                 continue
             dtype = display_dtype(detail.get("dtype", "unknown"))
+            if detail.get("base_data_ignored"):
+                base_data_ignored = True
             details = {}
             total = 0.0
             count = 0
@@ -157,6 +163,7 @@ def parse_benchmark_data(raw: dict) -> dict:
             "perf_avg": (sum(averages) / len(averages)) if averages else None,
             "base_miss_reasons": miss_reasons,
             "base_data_used": base_data_used,
+            "base_data_ignored": base_data_ignored,
             "matched_shapes": matched if base_data_used else None,
             "missed_shapes": missed if base_data_used else None,
         }
@@ -277,11 +284,26 @@ def write_markdown(path: Path, summary: dict, columns: list) -> None:
         lines += ["", "## Baseline misses", ""]
         lines += [f"- {op}: {reason}" for op, reason in misses]
 
+    ignored = [
+        op
+        for op, entry in summary["result"].items()
+        if entry["performance"].get("base_data_ignored")
+    ]
+    if ignored:
+        lines += ["", "## Base data ignored", ""]
+        lines += [
+            f"- {op}: the baseline is the native implementation, so PerfAvg is "
+            "the local Train Speedup"
+            for op in ignored
+        ]
+
     lines += [
         "",
         "PerfAvg is the arithmetic mean of the per-dtype means; a shape uses",
         "`compared_speedup` when the baseline matched, otherwise the local",
-        "torch-baseline `speedup`.",
+        'torch-baseline `speedup`. Operators in "Base data ignored" never use',
+        "`compared_speedup`: their baseline is the native implementation, so",
+        "`--base-data` does not apply to them.",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")

@@ -185,6 +185,9 @@ def test_fused_gated_norm_perf():
         op_name="fused_gated_norm",
         torch_op=torch_op,
         dtypes=_DTYPES,
+        # The local ratio is a real comparison when the baseline is Megatron's
+        # kernel, so --base-data's cross-hardware figure does not apply.
+        native_baseline=_mcore_fused_gated_norm is not None,
     )
     bench.set_train(train_op)
     bench.run()

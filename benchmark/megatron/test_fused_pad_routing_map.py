@@ -231,6 +231,9 @@ def test_fused_pad_routing_map_perf():
         torch_op=torch_op,
         # The dispatcher's map is boolean, so that is the contract measured here.
         dtypes=[torch.bool],
+        # Megatron's own kernel is a real local baseline; the torch transcription
+        # is not, and --base-data still applies to it.
+        native_baseline=_mcore_pad_routing_map is not None,
     )
     bench.set_train(train_op)
     bench.run()

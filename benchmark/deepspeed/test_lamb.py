@@ -242,6 +242,9 @@ def test_lamb_perf():
         torch_op=torch_op,
         # fused_lamb only supports float32 parameters/state.
         dtypes=[torch.float32],
+        # The local ratio is a real comparison when the baseline is DeepSpeed's
+        # fused_lamb, so --base-data's cross-hardware figure does not apply.
+        native_baseline=_deepspeed_lamb is not None,
     )
     bench.set_train(train_op)
     bench.run()

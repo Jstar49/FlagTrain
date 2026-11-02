@@ -249,6 +249,9 @@ def test_evoformer_attn_perf():
         op_name="evoformer_attn",
         torch_op=torch_op,
         dtypes=_DTYPES,
+        # The local ratio is a real comparison when the baseline is DeepSpeed's
+        # kernel, so --base-data's cross-hardware figure does not apply.
+        native_baseline=_deepspeed_evoformer is not None,
     )
     bench.set_train(train_op)
     bench.run()

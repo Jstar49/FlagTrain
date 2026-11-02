@@ -62,6 +62,14 @@ backends:
       # installed after the shared test dependencies, so it decides the final
       # version instead of the other way round.
       - numpy==1.26.4
+      # triton/backends/ascend/testing.py parses the torch_npu.profiler CSVs
+      # with pandas whenever do_bench_npu falls back from mspti, which reports
+      # inf when it captures fewer kernels than it expects; without it an
+      # ascend benchmark fails at `import pandas`. Pinned below 3 because
+      # pandas 3 requires numpy >= 2.0.2, and it has to be resolved in the same
+      # pip run as the numpy pin above -- installed separately, pip would pick
+      # pandas 3 first and leave an unimportable pair behind.
+      - pandas==2.3.2
       - megatron-core==0.17.1
 
   hygon:

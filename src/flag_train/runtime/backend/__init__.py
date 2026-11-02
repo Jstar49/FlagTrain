@@ -443,7 +443,13 @@ def get_customized_ops(vendor_name=None):
     import_vendor_extra_lib(vendor_name)
     if _state.customized_ops is not None:
         return _state.customized_ops
-    _state.customized_ops = list(iter_package_functions(_state.ops_module))
+    # Publish the list before filling it, as FlagGems does: walking the backend
+    # packages imports them, and an import can re-enter this function, which then
+    # returns what has been collected so far instead of starting a second walk
+    # and caching a partial answer over this one. Registration itself runs once,
+    # from flag_train/__init__.py, after every generic operator is imported.
+    _state.customized_ops = []
+    _state.customized_ops += iter_package_functions(_state.ops_module)
     _state.customized_ops += iter_package_functions(_state.fused_module)
     return _state.customized_ops
 

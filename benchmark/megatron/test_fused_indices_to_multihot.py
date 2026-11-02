@@ -68,6 +68,10 @@ def test_fused_indices_to_multihot():
         op_name="fused_indices_to_multihot",
         torch_op=fused_indices_converter.fused_indices_to_multihot,
         dtypes=consts.FLOAT_DTYPES,
+        # The module imports megatron-core unconditionally, so the baseline is
+        # always the upstream kernel and --base-data's cross-hardware figure
+        # does not apply.
+        native_baseline=True,
     )
     bench.set_train(flag_train.megatron.fused_indices_to_multihot)
     bench.run()

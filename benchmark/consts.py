@@ -559,6 +559,9 @@ class BenchmarkResult:
         native_baseline_skip_reason = getattr(self, "native_baseline_skip_reason", None)
         if native_baseline_skip_reason:
             header_title += f"Native baseline: N/A ({native_baseline_skip_reason})\n"
+        base_data_ignored = getattr(self, "base_data_ignored", None)
+        if base_data_ignored:
+            header_title += f"Base data: ignored ({base_data_ignored})\n"
         show_vs_base = any(m.compared_speedup is not None for m in self.result)
         col_names = [
             f"{'Status':<10}",
@@ -655,6 +658,9 @@ class BenchmarkResult:
         native_baseline_skip_reason = getattr(self, "native_baseline_skip_reason", None)
         if native_baseline_skip_reason:
             result_dict["native_baseline_skip_reason"] = native_baseline_skip_reason
+        base_data_ignored = getattr(self, "base_data_ignored", None)
+        if base_data_ignored:
+            result_dict["base_data_ignored"] = base_data_ignored
         return json.dumps(result_dict, default=custom_json_encoder)
 
     def to_dict(self) -> dict:

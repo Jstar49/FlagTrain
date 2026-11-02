@@ -133,6 +133,14 @@ class Benchmark:
     DEFAULT_SHAPE_DESC = "M, N"
     DEFAULT_SHAPE_FILES = "core_shapes.yaml"
     EPS = 1e-7
+    # True when ``torch_op`` IS the upstream/vendor implementation (megatron-core,
+    # ``deepspeed.ops.*``, flash-attn, ...) rather than a plain-torch transcription
+    # of it. The local Torch-vs-Train ratio is then already a real comparison, so
+    # ``--base-data`` is ignored for this operator: there is no "vs Base" column,
+    # and tools/perf_summary.py summarizes the raw Train Speedup instead. Set it
+    # from the same runtime resolution that picks ``torch_op`` -- e.g.
+    # ``native_baseline=_deepspeed_lamb is not None``.
+    native_baseline: bool = False
     """
     the base class for the operations benchmark
     """
@@ -521,12 +529,17 @@ class Benchmark:
         )
         if Config.native_baseline_skip_reason:
             result.native_baseline_skip_reason = Config.native_baseline_skip_reason
+        ignored_reason = self.base_data_ignored_reason()
+        if ignored_reason:
+            result.base_data_ignored = ignored_reason
         print(result)
         result_dict = asdict(result)
         if Config.native_baseline_skip_reason:
             result_dict["native_baseline_skip_reason"] = (
                 Config.native_baseline_skip_reason
             )
+        if ignored_reason:
+            result_dict["base_data_ignored"] = ignored_reason
         update_result(self.op_name, result_dict)
         emit_record_logger(result.to_json())
         return result
@@ -587,6 +600,18 @@ class Benchmark:
         Config.executed_case_ids.update(executed)
         return results
 
+    def base_data_ignored_reason(self):
+        """Why ``--base-data`` does not apply here, or ``None`` when it does.
+
+        A benchmark whose ``torch_op`` is the upstream implementation
+        (``native_baseline``) already measures a real reference on this device,
+        so the cross-hardware figure would replace a better number with a
+        worse one.
+        """
+        if Config.base_data is not None and self.native_baseline:
+            return "native baseline"
+        return None
+
     def _record_base_comparison(self, metric, dtype):
         """Fill ``compared_speedup`` from the optional NVIDIA baseline.
 
@@ -596,6 +621,8 @@ class Benchmark:
         missing, the raw ratio is kept and the precise miss reason is recorded.
         """
         if Config.base_data is None or not metric.latency:
+            return
+        if self.base_data_ignored_reason():
             return
         base_rec, miss_reason = lookup_base_record_ex(
             Config.base_data,
@@ -704,6 +731,15 @@ class Benchmark:
             return
 
         self.init_user_config()
+        ignored_reason = self.base_data_ignored_reason()
+        if ignored_reason:
+            # Once per operator, not once per shape: what changes is which
+            # baseline CI reports, and that is the same for every row.
+            print(
+                f"[base-data] {self.op_name}: ignored ({ignored_reason}); the "
+                "'vs Base' column is hidden and the summary uses the Train "
+                "Speedup."
+            )
         configured_case_ids = getattr(Config, "case_ids", None)
         selection_requested = case_ids is not None or configured_case_ids is not None
         selected_case_ids = case_ids if case_ids is not None else configured_case_ids

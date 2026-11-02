@@ -48,7 +48,8 @@ def quick_gelu_ref(x):
     return x * torch.sigmoid(1.702 * x)
 
 
-def base_op():
+def _load_mcore_quick_gelu():
+    """Megatron-LM's ``quick_gelu``, or ``None`` when it is not the baseline."""
     try:
         import megatron.core.activations
 
@@ -60,7 +61,16 @@ def base_op():
             RuntimeWarning,
             stacklevel=2,
         )
-        return quick_gelu_ref
+        return None
+
+
+# Resolved once, so the baseline is the same one ``native_baseline`` describes.
+_mcore_quick_gelu = _load_mcore_quick_gelu()
+
+
+def base_op():
+    """Baseline, chosen by platform. See ``_mcore_quick_gelu``."""
+    return _mcore_quick_gelu or quick_gelu_ref
 
 
 def _dtypes():
@@ -94,6 +104,9 @@ def _run(is_backward):
         torch_op=base_op(),
         dtypes=_dtypes(),
         is_backward=is_backward,
+        # Megatron's own activation is a real local baseline; the torch
+        # composition is not, and --base-data still applies to it.
+        native_baseline=_mcore_quick_gelu is not None,
     )
     bench.set_train(flag_train.megatron.quick_gelu)
     # On Ascend, enable parallel scheduling of all blocks to avoid excessive logical cores
