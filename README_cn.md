@@ -23,6 +23,11 @@ FlagOS runtime 镜像加上 `megatron-core` 构成：
 | 后端 | 镜像 |
 | --- | --- |
 | `nvidia-cuda133` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-generic-13.3:2.2.0-0.2.3` |
+| `ascend-cann9.0.0` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-ascend-cann9.0.0:2.2.0-0.2.3` |
+| `metax-c550` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-metax-maca3.8.1.3:2.2.0-0.2.3` |
+| `hygon-bw1000` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-hygon-dtk26.04:2.2.0-0.2.3` |
+| `iluvatar-BI-V150` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-iluvatar-corex4.5.0:2.2.0-0.2.3` |
+| `mthreads-MTT-S5000` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-mthreads-musa5.2.0:2.2.0-0.2.3` |
 
 镜像名和 tag 由 build-infra 维护。上表对应 `2.2.0-0.2.3` 发布，最新列表见
 <https://flagos-ai.github.io/release-info/>。
