@@ -34,6 +34,12 @@ nvidia = [
     "deepspeed-kernels",
 ]
 
+ascend = [
+    "decorator==5.1.1",
+    "attrs==24.2.0",
+    "psutil==6.0.0",
+    "pandas==2.3.2",
+]
 
 # --- END auto-generated from backends.yaml ---
 
