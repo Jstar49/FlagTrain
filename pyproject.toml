@@ -45,6 +45,7 @@ ascend = [
 
 test = [
     "pytest>=8.0",
+    "scipy>=1.15.3,<1.18.0",
 ]
 
 [tool.uv]
