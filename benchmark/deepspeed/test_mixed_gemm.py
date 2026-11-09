@@ -17,24 +17,27 @@ Run ``tests/deepspeed/test_mixed_gemm.py`` green first, then::
 
     pytest benchmark/deepspeed/test_mixed_gemm.py -v -s
 
-The baseline is ``_BoundReference`` -- dequantize the weight on device, then cuBLAS --
-working from the *logical* quantized matrix, so it does no layout arithmetic and the
-dequantization stays inside the timed region. The operator is the only side that has to
-get the packed layout right, so the ratio between them is a statement about this kernel.
-Comparing against an unquantized ``torch.mm`` would put a different amount of work on each
-side and needs its own benchmark.
+The baseline every run gets is ``_BoundReference`` -- dequantize the weight on device,
+then cuBLAS -- working from the *logical* quantized matrix, so it does no layout
+arithmetic and the dequantization stays inside the timed region. The operator is the
+only side that has to get the packed layout right, so the ratio between them is a
+statement about this kernel. Comparing against an unquantized ``torch.mm`` would put a
+different amount of work on each side and needs its own benchmark.
+
+The reference is a plain-torch composition, so it is available on every backend. A
+DeepSpeed baseline that cannot run on this GPU (its prebuilt ``dskernels`` package
+does not carry every compute capability, e.g. sm_90) must therefore not remove the
+comparison: it only skips ``test_mixed_gemm_vs_deepspeed``, the separate
+kernel-vs-kernel check, exactly as the correctness tests treat it.
 
 ``base.py`` hands the same args/kwargs to ``torch_op`` and to ``train_op``, so the two must
 have identical signatures; ``_call`` is what guarantees that here.
 """
 
-import os
-
 import pytest
 import torch
 
 import flag_train
-from flag_train.deepspeed import mixed_gemm
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 
@@ -115,38 +118,28 @@ def dequantize_logical(q, scales):
 
 
 # ---------------------------------------------------------------------------
-# The baseline, by platform
+# Baselines
 #
-# One rule, on one predicate, matching the rule ``tests/deepspeed/test_mixed_gemm.py``
-# uses to pick its oracle; here the tier decides what is **timed**, so the branch is
-# exclusive.
+# Same policy as the sibling benchmarks in this directory: the torch reference is
+# always timed, so a machine that cannot host DeepSpeed still gets a full table, and
+# a missing upstream kernel only skips the optional kernel-vs-kernel test.
 #
-# 1. A backend that runs DeepSpeed's own mixed_gemm uses that operator. It is the
-#    operator being ported, and it is required: if it cannot load, this module raises
-#    rather than reporting a torch reference under that name.
-# 2. Any other backend uses the torch reference -- a correct implementation, not the
-#    best one.
-#
-# ``FLAG_TRAIN_ALLOW_TORCH_BASELINE=1`` turns the raise into a fallback for a
-# development machine that cannot host the DeepSpeed baseline; the reason and the
-# chosen baseline are printed and carried on every row.
+# DeepSpeed's own mixed_gemm is compared separately in
+# ``test_mixed_gemm_vs_deepspeed``. There both sides read the same preprocessed B
+# layout, so the comparison is between kernels rather than between implementations of
+# the contract.
 # ---------------------------------------------------------------------------
 
-# Backends whose baseline is DeepSpeed. ``mixed_gemm`` ships as a CUDA op, so only a
-# backend that can compile and execute one can host it.
-_DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
-
-# Whether an unusable DeepSpeed baseline is fatal on those backends. Default true: a
-# dedicated environment should fail loudly rather than report a different measurement.
-_ALLOW_TORCH_BASELINE = os.environ.get(
-    "FLAG_TRAIN_ALLOW_TORCH_BASELINE", ""
-).strip().lower() in ("1", "true", "yes")
+# Backends on which DeepSpeed's operator is expected to be usable as the
+# kernel-vs-kernel reference. ``mixed_gemm`` ships as a CUDA op, so only a backend
+# that can compile and execute one can host it.
+_DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
 _DEEPSPEED_UNAVAILABLE_MSG = (
     "Its kernel ships prebuilt in the `dskernels` package, and "
     "`InferenceCutlassBuilder` links `-ldeepspeedft` rather than compiling it, so that "
-    "package has to carry this GPU's compute capability. Install one that does, or drop "
-    "the backend from _DEEPSPEED_BASELINE_VENDORS."
+    "package has to carry this GPU's compute capability. Install one that does, or "
+    "drop the backend from _DEEPSPEED_BASELINE_VENDORS."
 )
 
 
@@ -186,58 +179,15 @@ def _load_deepspeed_mixed_gemm():
 # Resolved once, at module import time.
 _DEEPSPEED_ORACLE, _DEEPSPEED_REASON = _load_deepspeed_mixed_gemm()
 
-_REQUIRED = flag_train.vendor_name in _DEEPSPEED_BASELINE_VENDORS
+# The baseline every run gets, on every backend. It never depends on the upstream
+# kernel being loadable here.
+_BASELINE = "torch reference (dequantize on device, then cuBLAS)"
 
-# Whether this platform owes a DeepSpeed baseline that is not there. Recorded rather
-# than raised: raising at import is a pytest collection error, which says nothing
-# about this operator.
-_BASELINE_REQUIRED_BUT_UNAVAILABLE = _REQUIRED and _DEEPSPEED_ORACLE is None
-
-_WHY = (
-    f"{flag_train.vendor_name!r} must use DeepSpeed's mixed_gemm as its baseline, "
-    f"which {_DEEPSPEED_REASON}. {_DEEPSPEED_UNAVAILABLE_MSG}"
+_DEEPSPEED_SKIP_REASON = (
+    f"DeepSpeed's mixed_gemm {_DEEPSPEED_REASON}. {_DEEPSPEED_UNAVAILABLE_MSG}"
+    if _DEEPSPEED_ORACLE is None and _DEEPSPEED_REASON is not None
+    else _DEEPSPEED_UNAVAILABLE_MSG
 )
-
-# The framework's own way of saying "no native baseline here": the autouse
-# ``configure_native_baseline`` fixture reads this marker and sets ``Config.skip_native``,
-# so the ``torch_op`` timing is skipped and the report prints ``Native baseline: N/A``.
-# ``pytestmark`` is enough because the fixture runs after import, i.e. after collection.
-if _BASELINE_REQUIRED_BUT_UNAVAILABLE and not _ALLOW_TORCH_BASELINE:
-    _NATIVE_SKIP_REASON = (
-        f"DeepSpeed's mixed_gemm {_DEEPSPEED_REASON}; {_DEEPSPEED_UNAVAILABLE_MSG}"
-    )
-    # Appended rather than assigned: a future module-level marker added above would
-    # otherwise be silently dropped by this branch.
-    pytestmark = globals().get("pytestmark", [])
-    pytestmark.append(
-        pytest.mark.skip_native(
-            vendors=flag_train.vendor_name, reason=_NATIVE_SKIP_REASON
-        )
-    )
-
-
-if _BASELINE_REQUIRED_BUT_UNAVAILABLE and _ALLOW_TORCH_BASELINE:
-    _FALLBACK_NOTE = (
-        "FLAG_TRAIN_ALLOW_TORCH_BASELINE=1 is set, so this run measures against the\n"
-        "TORCH REFERENCE instead. It is NOT a competitor: it materializes the\n"
-        "dequantized weight and reads it back, which is exactly the round trip this\n"
-        "operator's fusion removes. Every ratio below says how far the kernel is\n"
-        "from *a* correct implementation, not from the best one.\n"
-        "The upstream comparison needs a compute capability the prebuilt kernels\n"
-        "cover (sm_80 / sm_86) -- re-run there before quoting these numbers as a\n"
-        "port's cost."
-    )
-    print("\n" + "!" * 78)
-    for _line in (_WHY + "\n\n" + _FALLBACK_NOTE).splitlines():
-        print(f"!! {_line}".rstrip())
-    print("!" * 78)
-
-if _DEEPSPEED_ORACLE is not None:
-    _ORACLE = "deepspeed"
-    _BASELINE = "deepspeed mixed_gemm"
-else:
-    _ORACLE = "torch_ref"
-    _BASELINE = "torch reference (dequantize on device, then cuBLAS)"
 
 
 # ---------------------------------------------------------------------------
@@ -324,20 +274,20 @@ class _BoundReference:
 
 
 def torch_op(**kwargs):
-    """Baseline, chosen by platform. See the module docstring.
+    """The baseline: the torch reference, on every backend and every GPU.
 
-    The DeepSpeed branch reads the same preprocessed buffer as the operator; the torch
-    branch works from the logical matrix, which arrives bound to the object because
-    ``base`` passes one argument tuple to both ops.
+    It works from the logical matrix, which arrives bound to the object because
+    ``base`` passes one argument tuple to both ops. Keeping the baseline independent
+    of DeepSpeed's prebuilt kernels is what lets the speedup column be populated on
+    parts those kernels do not support; the kernel-vs-kernel comparison is a separate
+    test.
     """
-    if _DEEPSPEED_ORACLE is not None:
-        return _call(_DEEPSPEED_ORACLE, **kwargs)
     return _call(_BoundReference(kwargs["q"]), **kwargs)
 
 
 def train_op(**kwargs):
     """The operator under test."""
-    return _call(mixed_gemm, **kwargs)
+    return _call(flag_train.deepspeed.mixed_gemm, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -357,41 +307,12 @@ class MixedGemmBenchmark(base.GenericBenchmark):
         return []
 
 
-def _peak_memory_mb():
-    """Peak device memory since the last reset, in MiB.
-
-    The framework does not report this, and saving memory is half of what weight-only
-    quantization is for.
-    """
-    try:
-        return torch.cuda.max_memory_allocated() / (1 << 20)
-    except Exception:  # noqa: BLE001
-        return float("nan")
-
-
-def _weight_bytes(shape, num_bits):
-    """``(packed_bytes, fp16_bytes)`` for the weight of ``shape``."""
-    _, k, n, _ = shape
-    packed = k * ((n + 1) // 2 if num_bits == 4 else n)
-    return packed, k * n * 2
-
-
 @pytest.mark.mixed_gemm
-def test_mixed_gemm_perf():
+def test_mixed_gemm():
     """Time the operator against the baseline. See the module docstring."""
-    # No baseline check: on a platform that cannot load the upstream kernel the
-    # module-level ``skip_native`` marker already tells the framework to report it as
-    # N/A. The tier goes first, so a moved number says whether its baseline moved too.
-    print(f"\nOracle: {_ORACLE}\nBaseline: {_BASELINE}")
-    print(f"  dtypes={[str(d) for d in _DTYPES]}  act=IDENTITY (id 6)")
-    print("  weight size per shape (int4/int8, and the fp16 it replaces):")
-    for shape in _SHAPES:
-        m, k, n, num_bits = shape
-        packed, fp16 = _weight_bytes(shape, num_bits)
-        print(
-            f"    {m}x{k}x{n} int{num_bits} {packed / (1 << 20):6.2f} MiB vs "
-            f"fp16 {fp16 / (1 << 20):6.2f} MiB ({fp16 / packed:.1f}x smaller)"
-        )
+    # The torch reference is always available, so this table is complete on any
+    # backend; only the DeepSpeed kernel comparison below can be skipped.
+    print(f"\nBaseline: {_BASELINE}")
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -400,34 +321,6 @@ def test_mixed_gemm_perf():
         input_fn=mixed_gemm_input_fn,
         op_name="mixed_gemm",
         torch_op=torch_op,
-        dtypes=_DTYPES,
-    )
-    bench.set_train(train_op)
-    bench.run()
-
-    peak = _peak_memory_mb()
-    if peak == peak:  # not NaN
-        print(f"  peak device memory: {peak:.1f} MiB")
-
-
-@pytest.mark.mixed_gemm
-@pytest.mark.skipif(_DEEPSPEED_ORACLE is None, reason=_DEEPSPEED_UNAVAILABLE_MSG)
-def test_mixed_gemm_vs_deepspeed():
-    """Report DeepSpeed's own operator on the same shapes.
-
-    Separate from the ratio above: both sides read the same preprocessed B layout, so
-    this compares kernels over identical inputs.
-    """
-    print(f"\nDeepSpeed oracle: {_ORACLE}")
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
-    bench = MixedGemmBenchmark(
-        input_fn=mixed_gemm_input_fn,
-        op_name="mixed_gemm",
-        # DeepSpeed's operator takes the same seven arguments ours does, so it goes
-        # through `_call` unchanged -- nothing to bind, it reads the packed buffer.
-        torch_op=lambda **kw: _call(_DEEPSPEED_ORACLE, **kw),
         dtypes=_DTYPES,
     )
     bench.set_train(train_op)
