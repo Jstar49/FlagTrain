@@ -494,14 +494,14 @@ _DEEPSPEED_UNAVAILABLE_MSG = (
 
 
 def _load_deepspeed_mixed_gemm():
-    """DeepSpeed's ``mixed_gemm``, or ``None`` when there is not a usable one.
+    """``(op, reason)`` -- ``op`` is ``None`` when there is not a usable one.
 
     ``None`` covers both "this backend does not use DeepSpeed" and "it is installed
     but cannot run here"; which of those is fatal is ``_REQUIRE_DEEPSPEED``'s
-    decision.
+    decision. ``reason`` records the finding for the skip message.
     """
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
-        return None
+        return None, None
 
     try:
         from deepspeed.ops.op_builder import InferenceCutlassBuilder
@@ -509,7 +509,7 @@ def _load_deepspeed_mixed_gemm():
         op = InferenceCutlassBuilder().load().mixed_gemm
     except Exception as exc:  # noqa: BLE001
         logger.warning("DeepSpeed's mixed_gemm could not be loaded: %s", exc)
-        return None
+        return None, f"could not be loaded: {exc!r}"
 
     # Import success says nothing about dispatch here; a signal or an exception is the
     # finding.
@@ -525,23 +525,31 @@ def _load_deepspeed_mixed_gemm():
         torch_device_fn.synchronize()
     except Exception as exc:  # noqa: BLE001
         logger.warning("DeepSpeed's mixed_gemm does not run here: %s", exc)
-        return None
+        return None, f"loaded but does not run here: {exc!r}"
 
-    return op
+    return op, None
 
 
 # Resolved once, at module import time.
-_DEEPSPEED_ORACLE = _load_deepspeed_mixed_gemm()
+_DEEPSPEED_ORACLE, _DEEPSPEED_REASON = _load_deepspeed_mixed_gemm()
 
 if _DEEPSPEED_ORACLE is None and _REQUIRE_DEEPSPEED:
     raise RuntimeError(
         f"{flag_train.vendor_name!r} must use DeepSpeed's mixed_gemm as its reference, "
-        f"but it is not usable. {_DEEPSPEED_UNAVAILABLE_MSG}"
+        f"but it is not usable: {_DEEPSPEED_REASON or 'not available on this backend'}. "
+        f"{_DEEPSPEED_UNAVAILABLE_MSG}"
     )
 
-# The torch reference is always available, so only the DeepSpeed check skips.
+# The torch reference is always available, so only the DeepSpeed check skips. The
+# reason carries the probe's finding ("could not be loaded" / "does not run here"),
+# which is otherwise only visible at warning level.
+_DEEPSPEED_SKIP_REASON = (
+    f"DeepSpeed's mixed_gemm {_DEEPSPEED_REASON}. {_DEEPSPEED_UNAVAILABLE_MSG}"
+    if _DEEPSPEED_ORACLE is None and _DEEPSPEED_REASON is not None
+    else _DEEPSPEED_UNAVAILABLE_MSG
+)
 requires_deepspeed_reference = pytest.mark.skipif(
-    _DEEPSPEED_ORACLE is None, reason=_DEEPSPEED_UNAVAILABLE_MSG
+    _DEEPSPEED_ORACLE is None, reason=_DEEPSPEED_SKIP_REASON
 )
 
 
@@ -605,6 +613,7 @@ _DTYPES = [torch.float16, torch.bfloat16]
 _DTYPE_IDS = ["fp16", "bf16"]
 
 
+@pytest.mark.mixed_gemm
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @pytest.mark.parametrize("num_bits", _BITS, ids=[f"int{b}" for b in _BITS])
 @pytest.mark.parametrize("activation_raw", _ACTS, ids=_ACT_IDS)
@@ -890,12 +899,16 @@ def test_matches_deepspeed(shape, num_bits):
     """
     m, k, n = shape
     dtype = torch.float16
-    output, hidden, packed, q, scales, bias = _build(m, k, n, num_bits, dtype, seed=10)
+    output, hidden, packed, q, scales, _ = _build(m, k, n, num_bits, dtype, seed=10)
 
+    # Both sides must get the *same* arguments. ``_build`` always returns a bias, but
+    # this case is the no-bias path; passing it to only one side would make DeepSpeed
+    # add a random vector the port never sees, and the comparison would fail for a
+    # reason that has nothing to do with the kernel.
     mixed_gemm(output, hidden, packed, scales, None, num_bits, 6)
 
     ref_out = torch.empty_like(output)
-    _DEEPSPEED_ORACLE(ref_out, hidden, packed, scales, bias, num_bits, 6)
+    _DEEPSPEED_ORACLE(ref_out, hidden, packed, scales, None, num_bits, 6)
     utils.train_assert_close(
         utils.to_reference(ref_out),
         utils.to_reference(output),
