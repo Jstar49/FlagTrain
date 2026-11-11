@@ -1,6 +1,12 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark FP8 GEMM against DeepSpeed, with an eager Torch fallback."""
+"""Benchmark FP8 GEMM against DeepSpeed's native Triton kernel.
+
+The native kernel is the only on-machine baseline. When it cannot be loaded,
+or this shape's tiles do not fit, there is no baseline to time: an eager Torch
+composition is a correctness reference, not a competitor, so ``torch_op`` is
+``None`` and ``--base-data`` supplies the comparison.
+"""
 
 import functools
 import math
@@ -34,58 +40,14 @@ def make_portable_inputs(m, k, n, dtype, group_size, device):
     return x.to(device), weight.to(device), scale.to(device)
 
 
-@functools.lru_cache(maxsize=16)
-def _custom_e4m3_codebook(device):
-    """Immutable format constants only; never cache input weights or indices."""
-    return torch.tensor(
-        [
-            math.ldexp(
-                (-1.0 if code & 128 else 1.0) * (8 + (code & 7)),
-                ((code >> 3) & 15) - 10,
-            )
-            for code in range(256)
-        ],
-        dtype=torch.float32,
-        device=device,
-    )
-
-
-def torch_dequantize_custom_e4m3(weight, scale, group_size, dtype):
-    """Vectorized Torch eager format lookup, separate from the arithmetic oracle.
-
-    All 256 codes are finite, including exponent zero/15. Cache only the fixed
-    1 KiB format table, not decoded/scaled weights, input-derived indices or
-    outputs. Each call reads every input byte and performs lookup and scaling.
-    Full groups use broadcast scaling, with a separate final partial group.
-    No per-call host transfers, scalar reads, compilation or Python row loop.
-    """
-    indices = weight.reshape(-1).to(torch.int32)
-    values = torch.index_select(_custom_e4m3_codebook(weight.device), 0, indices)
-    scales = scale.reshape(-1)
-    full, tail = divmod(weight.numel(), group_size)
-    if not tail:
-        scaled = values.reshape(full, group_size) * scales.reshape(-1, 1)
-    else:
-        prefix = values[: full * group_size].reshape(full, group_size)
-        prefix = (prefix * scales[:full].reshape(-1, 1)).reshape(-1)
-        suffix = values[full * group_size :] * scales[full]
-        scaled = torch.cat((prefix, suffix))
-    return scaled.reshape(weight.shape).to(dtype)
-
-
-def torch_composite_matmul(x, weight, scale, group_size):
-    """Decode, scale and round on each call before native-dtype matmul."""
-    decoded = torch_dequantize_custom_e4m3(weight, scale, group_size, x.dtype)
-    return torch.matmul(x, decoded)
-
-
 @functools.lru_cache(maxsize=1)
 def _load_deepspeed_fp8_gemm():
     try:
         from deepspeed.ops.fp_quantizer.fp8_gemm_triton import matmul_fp8_triton
     except Exception as exc:
         warnings.warn(
-            f"DeepSpeed FP8 GEMM could not be loaded: {exc!r}; using Torch.",
+            f"DeepSpeed FP8 GEMM could not be loaded: {exc!r}; no on-machine "
+            f"baseline, --base-data is the only comparison.",
             stacklevel=2,
         )
         return None
@@ -102,28 +64,27 @@ class Fp8GemmBenchmark(base.GenericBenchmark):
         return []
 
     def _measure_input(self, inputs, case_id=None):
-        previous_op = self.torch_op
-        if "latency_base" in self.to_bench_metrics and not base.Config.skip_native:
-            args, kwargs = self.unpack_to_args_kwargs(inputs)
-            upstream = _load_deepspeed_fp8_gemm()
-            if upstream is not None:
-                # Probe this exact shape outside timing; large tiles may not fit.
-                try:
-                    upstream(*args, **kwargs)
-                except (OutOfResources, NotImplementedError) as exc:
-                    warnings.warn(
-                        f"DeepSpeed FP8 GEMM unavailable for {tuple(args[0].shape)}: "
-                        f"{exc!r}; using Torch.",
-                        stacklevel=2,
-                    )
-                else:
-                    self.torch_op = upstream
-            reference = "DeepSpeed" if self.torch_op is upstream else "Torch"
-            print(f"FP8 GEMM baseline {tuple(args[0].shape)}: {reference}")
-        try:
-            metric = super()._measure_input(inputs, case_id=case_id)
-        finally:
-            self.torch_op = previous_op
+        args, kwargs = self.unpack_to_args_kwargs(inputs)
+        upstream = _load_deepspeed_fp8_gemm()
+        if upstream is not None:
+            # Probe this exact shape outside timing; large tiles may not fit.
+            try:
+                upstream(*args, **kwargs)
+            except (OutOfResources, NotImplementedError) as exc:
+                warnings.warn(
+                    f"DeepSpeed FP8 GEMM unavailable for {tuple(args[0].shape)}: "
+                    f"{exc!r}; no on-machine baseline for this case.",
+                    stacklevel=2,
+                )
+                upstream = None
+        # The row's on-machine baseline. The harness reads it for the
+        # latency-base timing and for Method A's "no baseline at all" check;
+        # ``None`` leaves --base-data as the only comparison.
+        self.torch_op = upstream
+        reference = "DeepSpeed" if upstream is not None else "none (--base-data only)"
+        print(f"FP8 GEMM baseline {tuple(args[0].shape)}: {reference}")
+
+        metric = super()._measure_input(inputs, case_id=case_id)
         assert metric.error_msg is None, f"{case_id}: {metric.error_msg}"
         if metric.speedup is not None:
             label = case_id or metric.shape_detail
@@ -144,7 +105,10 @@ def test_fp8_gemm_triton_perf():
     bench = Fp8GemmBenchmark(
         input_fn=fp8_input_fn,
         op_name=OP_NAME,
-        torch_op=torch_composite_matmul,
+        # None: only DeepSpeed's native kernel is a baseline. Each row swaps in
+        # the native op in ``_measure_input`` when this shape fits, and leaves
+        # None otherwise so --base-data supplies the comparison.
+        torch_op=None,
         dtypes=DTYPES,
     )
     bench.set_train(flag_train.deepspeed.fp8_gemm_triton)

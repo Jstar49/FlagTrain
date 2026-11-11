@@ -670,7 +670,7 @@ class Benchmark:
         if base_ms is None:
             metric.base_miss_reason = miss_reason
             print(f"[vs Base][miss] {miss_reason}")
-            if self.torch_op is None:
+            if self.torch_op is None and not Config.skip_native:
                 # Method A, ported from FlagGems-vllm: with no vendor-native
                 # implementation on this machine and no NV baseline record,
                 # no baseline exists at all. Fail instead of publishing a row

@@ -13,21 +13,25 @@
 # limitations under the License.
 """Performance benchmark for the mixed_moe_gemm operator.
 
-There is no vendor-native baseline: DeepSpeed has no ``mixed_moe_gemm``, so the
-only local implementation of the same contract is a dequantization plus
-per-expert PyTorch GEMM loop. A torch composition is not a competitor and is
-not timed: ``torch_op`` is ``None``, the benchmark reports Train latency only,
-and ``--base-data`` is the only comparison. The same composition is still used
-as an untimed correctness check in the input builder.
+The baseline is DeepSpeed's CUTLASS ``mixed_moe_gemm`` binding on the backends
+that ship it -- the kernel this port is a port *of*. When it cannot be loaded,
+there is no on-machine baseline: a dequantization plus per-expert PyTorch GEMM
+is a correct implementation, not a competitor, so it is not timed;
+``torch_op`` is ``None`` and ``--base-data`` is the only comparison. The same
+composition is still used as an untimed correctness check in the input
+builder.
 """
 
 import math
+import warnings
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 import flag_train
+from flag_train.runtime import device as runtime_device
+from flag_train.runtime import torch_device_fn
 
 from .. import base
 
@@ -50,7 +54,155 @@ class MixedMoEGEMMBenchmark(base.GenericBenchmark):
         return []
 
 
-_BASELINE = "none (no on-machine baseline; --base-data is the only comparison)"
+# Backends on which DeepSpeed's CUTLASS MoE GEMM is expected to be usable.
+# It ships as a CUDA extension, so only a backend that can compile and execute
+# one can host it.
+_DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
+
+_DEEPSPEED_UNAVAILABLE_MSG = (
+    "Its kernel ships prebuilt in DeepSpeed's CUTLASS extension "
+    "(InferenceCutlassBuilder), which has to carry this GPU's compute "
+    "capability. Install a build that does, or drop the backend from "
+    "_DEEPSPEED_BASELINE_VENDORS."
+)
+
+
+def _deepspeed_weight_buffer(weights, num_bits, n):
+    """Convert the benchmark's weights to the layout DeepSpeed's binding takes.
+
+    ``weights`` is what the FlagTrain operator reads: int8 ``[E, K, N]`` for
+    8-bit, packed uint8 ``[E, K, N/2]`` for 4-bit. DeepSpeed's CUTLASS binding
+    takes unsigned offset-binary data: ``(q + 128)`` per byte for 8-bit, and
+    ``(q + 8)`` nibbles packed over an ``E*K*N/2``-byte buffer exposed through
+    an ``[E, K, N]`` ``as_strided`` view. The binding validates ``size(2)``
+    but addresses the packed bytes by pointer, so the view has zero strides
+    along E and K.
+
+    This is a timing baseline, not a numerical oracle: DeepSpeed's weight byte
+    order is a CUTLASS-internal interleave it exposes no preprocessing for, so
+    the kernel reads the right footprint but the values are not compared.
+    """
+    if num_bits == 8:
+        return (weights.to(torch.int16) + 128).to(torch.uint8)
+
+    if n % 2:
+        raise RuntimeError(f"mixed_moe_gemm 4-bit weights need an even N, got N={n}")
+    unsigned = weights.to(torch.int16)
+    low = unsigned & 15
+    high = (unsigned >> 4) & 15
+    values = torch.stack((low, high), dim=-1).flatten(-2)[..., :n]
+    signed = torch.where(values >= 8, values - 16, values)
+    nibbles = (signed + 8).to(torch.uint8)
+    experts, k, _ = signed.shape
+    packed = nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)
+    size = experts * k * n // 2
+    buffer = torch.zeros(size + 128, dtype=torch.uint8, device=weights.device)
+    buffer[:size] = packed.reshape(-1)
+    return torch.as_strided(buffer, (experts, k, n), (0, 0, 1))
+
+
+class _DeepSpeedBaseline:
+    """DeepSpeed's binding, with the benchmark's weights converted once per input.
+
+    ``base`` hands the same argument tuple to both ops, so the conversion has
+    to happen here. It is cached per input tensor: the harness reuses one
+    input for every timed iteration and the first call is warmup, so the
+    conversion never lands inside the measured window.
+    """
+
+    def __init__(self, op):
+        self._op = op
+        self._source = None
+        self._num_bits = None
+        self._converted = None
+
+    def __call__(self, output, x, weights, scales, biases, rows, num_bits, activation):
+        if weights is not self._source or num_bits != self._num_bits:
+            self._source = weights
+            self._num_bits = num_bits
+            self._converted = _deepspeed_weight_buffer(
+                weights, num_bits, scales.shape[1]
+            )
+        return self._op(
+            output,
+            x,
+            self._converted,
+            scales,
+            biases,
+            rows,
+            num_bits,
+            activation,
+        )
+
+
+def _probe_deepspeed_mixed_moe_gemm(op):
+    """Call the binding once per bit width, so a load that cannot run fails here."""
+    experts, tokens, k, n = 2, 2, 1024, 1024
+    device = runtime_device.name
+    dtype = torch.float16
+    scales = torch.rand((experts, n), dtype=dtype, device=device)
+    biases = torch.randn((experts, n), dtype=dtype, device=device)
+    rows = torch.arange(1, experts + 1, dtype=torch.int64, device=device) * tokens
+    x = torch.randn((experts * tokens, k), dtype=dtype, device=device)
+    output = torch.empty((experts * tokens, n), dtype=dtype, device=device)
+
+    for num_bits, limit in ((8, 128), (4, 8)):
+        signed = torch.randint(
+            -limit, limit, (experts, k, n), dtype=torch.int8, device=device
+        )
+        if num_bits == 8:
+            flag_weights = signed
+        else:
+            values = signed.to(torch.int16)
+            flag_weights = (
+                (values[..., 0::2] & 15) | ((values[..., 1::2] & 15) << 4)
+            ).to(torch.uint8)
+        weight = _deepspeed_weight_buffer(flag_weights, num_bits, n)
+        op(output, x, weight, scales, biases, rows, num_bits, 6)
+
+    torch_device_fn.synchronize()
+
+
+def _load_deepspeed_mixed_moe_gemm():
+    """``(op, reason)`` -- ``op`` is ``None`` when there is not a usable one."""
+    if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
+        return None, None
+
+    try:
+        from deepspeed.ops.op_builder import InferenceCutlassBuilder
+
+        op = InferenceCutlassBuilder().load().mixed_moe_gemm
+    except Exception as exc:  # noqa: BLE001
+        return None, f"could not be loaded: {exc!r}"
+
+    try:
+        _probe_deepspeed_mixed_moe_gemm(op)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"loaded but does not run here: {exc!r}"
+
+    return op, None
+
+
+# Resolved once, at module import time.
+_DEEPSPEED_ORACLE, _DEEPSPEED_REASON = _load_deepspeed_mixed_moe_gemm()
+
+_WHY = (
+    f"{flag_train.vendor_name!r} is expected to use DeepSpeed's mixed_moe_gemm "
+    f"as its baseline, which {_DEEPSPEED_REASON}. {_DEEPSPEED_UNAVAILABLE_MSG}"
+)
+
+if _DEEPSPEED_ORACLE is not None:
+    _BASELINE = "deepspeed mixed_moe_gemm"
+    torch_op = _DeepSpeedBaseline(_DEEPSPEED_ORACLE)
+else:
+    _BASELINE = "none (no on-machine baseline; --base-data is the only comparison)"
+    if flag_train.vendor_name in _DEEPSPEED_BASELINE_VENDORS:
+        warnings.warn(
+            f"{_WHY} This run has no on-machine baseline; a torch composition "
+            f"is not timed, so --base-data is the only comparison.",
+            stacklevel=2,
+        )
+    torch_op = None
 
 
 def _reference(output, x, weights, scales, biases, rows, num_bits, activation):
@@ -130,9 +282,7 @@ def test_mixed_moe_gemm_perf(num_bits, activation):
     bench = MixedMoEGEMMBenchmark(
         input_fn=make_inputs,
         op_name="mixed_moe_gemm",
-        # None: no vendor-native implementation exists, and a torch composition
-        # is not timed as a baseline, so --base-data supplies the comparison.
-        torch_op=None,
+        torch_op=torch_op,
         dtypes=[torch.float16, torch.bfloat16],
     )
     bench.set_train(flag_train.deepspeed.mixed_moe_gemm)
