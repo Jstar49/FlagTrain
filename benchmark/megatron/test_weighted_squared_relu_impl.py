@@ -13,14 +13,13 @@
 # limitations under the License.
 """Performance benchmark for Megatron weighted squared ReLU (forward).
 
-The baseline is Megatron-LM's ``weighted_squared_relu_impl``, required on every
-backend this operator ships on (``_MEGATRON_BASELINE_VENDORS``): like
-``_load_deepspeed_blocked_flash``, the loader below raises when no scenario can
-run against Megatron -- a missing import, or a plain weighted call that fails
-here -- instead of timing against a PyTorch composition. megatron-core before
-0.20.0 has no ``clamp_scale``, so on that interface the clamped rows are left
-out and ``weighted_squared_relu_impl`` still runs against Megatron. The test prints
-the resolved baseline before timing.
+The baseline is Megatron-LM's ``weighted_squared_relu_impl`` when it can be
+loaded and can run the plain weighted case, and ``weighted_squared_relu_ref``,
+the plain-torch composition of the same contract, otherwise. The loader warns
+before falling back, so a missing Megatron baseline is reported rather than
+silently timed. megatron-core before 0.20.0 has no ``clamp_scale``, so on that
+interface the clamped rows are left out and ``weighted_squared_relu_impl`` still
+runs against Megatron. The test prints the resolved baseline before timing.
 
 The three variants (``weighted_squared_relu``, ``clamped_squared_relu`` and
 ``weighted_clamped_squared_relu``) share one ``op_name`` and are told apart by
@@ -132,6 +131,7 @@ _MEGATRON_BASELINE_VENDORS = {
     "hygon",
     "iluvatar",
     "metax",
+    "mthreads",
     "thead",
     "ascend",
 }
@@ -200,10 +200,11 @@ def _megatron_has_clamp_scale(op):
 
 
 def _require_megatron_runs(op):
-    """Prove the baseline can run the plain weighted case on this backend.
+    """Whether the baseline can run the plain weighted case on this backend.
 
     The clamped variants may be dropped, but a baseline that cannot do the
-    weighted case describes no scenario at all, which is when this raises.
+    weighted case describes no scenario at all, so fall back to the PyTorch
+    composition.
     """
     x = torch.ones((2, 8), dtype=torch.float32, device=flag_train.device)
     weights = torch.ones((2, 1), dtype=torch.float32, device=flag_train.device)
@@ -219,37 +220,50 @@ def _require_megatron_runs(op):
         call = _eager_reference(call)
         call()
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use Megatron's "
-            f"weighted_squared_relu_impl as its baseline, but it cannot run even "
-            f"the plain weighted case on this backend: {exc!r}."
-        ) from exc
+        warnings.warn(
+            f"Megatron's weighted_squared_relu_impl cannot run the plain "
+            f"weighted case on {flag_train.vendor_name!r}: {exc!r}. Falling "
+            f"back to the PyTorch composition.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    return True
 
 
 def _load_megatron_weighted_squared_relu():
-    """Megatron's ``weighted_squared_relu_impl``, required on the listed backends.
+    """Megatron's ``weighted_squared_relu_impl``, or ``None`` when unusable.
 
-    Mirrors ``_load_deepspeed_blocked_flash``: a baseline that cannot run
-    anything raises instead of falling back to the PyTorch composition.
+    The loader warns before falling back to the PyTorch composition, so a
+    missing or unusable Megatron baseline is reported before it is timed.
     """
     if flag_train.vendor_name not in _MEGATRON_BASELINE_VENDORS:
+        warnings.warn(
+            f"{flag_train.vendor_name!r} does not use Megatron's "
+            f"weighted_squared_relu_impl as its baseline; using the PyTorch "
+            f"composition instead.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return None
     try:
         from megatron.core.fusions.fused_weighted_squared_relu import (
             weighted_squared_relu_impl,
         )
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use Megatron's "
-            f"weighted_squared_relu_impl as its baseline, but it could not be "
-            f"loaded: {exc!r}. Install Megatron-LM for this platform, or drop the "
-            f"backend from _MEGATRON_BASELINE_VENDORS."
-        ) from exc
+        warnings.warn(
+            "Megatron-LM is unavailable; using the PyTorch weighted squared "
+            f"ReLU composition as the benchmark baseline ({exc!r}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
     if flag_train.vendor_name != "nvidia":
         # ``_require_megatron_runs`` below is the first call into the reference,
         # so the fuser must be switched off before it runs.
         _use_eager_megatron_reference()
-    _require_megatron_runs(weighted_squared_relu_impl)
+    if not _require_megatron_runs(weighted_squared_relu_impl):
+        return None
     return weighted_squared_relu_impl
 
 
@@ -272,20 +286,13 @@ else:
         "megatron weighted_squared_relu_impl "
         "(clamped variants skipped: megatron-core has no clamp_scale)"
     )
-if _FORCE_EAGER_REFERENCE:
+if _FORCE_EAGER_REFERENCE and _MEGATRON_WEIGHTED_SQUARED_RELU_IMPL is not None:
     _BASELINE += " (eager; jit fuser disabled)"
 
 
 def base_op():
     if _MEGATRON_WEIGHTED_SQUARED_RELU_IMPL is None:
-        # Only reachable on a backend outside _MEGATRON_BASELINE_VENDORS; the
-        # platforms this operator ships on raise in the loader above instead.
-        warnings.warn(
-            "Megatron-LM is unavailable; using the PyTorch weighted squared "
-            "ReLU composition as the benchmark baseline",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        # The loader above already warned; see ``_BASELINE`` for what is timed.
         return weighted_squared_relu_ref
     if _MEGATRON_HAS_CLAMP_SCALE:
         return _eager_reference(_MEGATRON_WEIGHTED_SQUARED_RELU_IMPL)

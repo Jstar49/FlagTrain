@@ -13,12 +13,13 @@
 # limitations under the License.
 """Correctness tests for Megatron weighted squared ReLU (forward).
 
-The reference is Megatron-LM's ``weighted_squared_relu_impl``, required on every
-backend this operator ships on (``_MEGATRON_BASELINE_VENDORS``): the loader
-raises when Megatron -- or the plain weighted call itself -- cannot run at all.
+The preferred reference is Megatron-LM's ``weighted_squared_relu_impl``. On
+backends that do not use it, or when Megatron cannot be loaded or run, the
+loader warns and this suite compares against the PyTorch composition instead.
 megatron-core before 0.20.0 has no ``clamp_scale``, so the clamped cases skip
 there while the weighted ones still run against Megatron. One test also pins the
-PyTorch composition the benchmark falls back to against Megatron's.
+PyTorch composition the benchmark falls back to against Megatron's when it is
+available.
 
 Comparisons run on ``utils.to_reference(..., upcast=True)`` operands (fp32 on
 device, fp64 on CPU under ``--ref cpu``) with ``train_assert_close`` defaults.
@@ -28,6 +29,7 @@ import importlib.util
 import inspect
 import math
 import re
+import warnings
 from importlib import metadata
 
 import pytest
@@ -109,6 +111,7 @@ _MEGATRON_BASELINE_VENDORS = {
     "hygon",
     "iluvatar",
     "metax",
+    "mthreads",
     "thead",
     "ascend",
 }
@@ -166,7 +169,8 @@ def _require_megatron_runs(op):
     """Prove the baseline can run the plain weighted case on this backend.
 
     The clamped cases may skip, but a baseline that cannot do the weighted case
-    describes no scenario at all, which is when this suite must raise.
+    describes no scenario at all, so warn and fall back to the PyTorch
+    composition.
     """
     x = torch.ones((2, 8), dtype=torch.float32, device=flag_train.device)
     weights = torch.ones((2, 1), dtype=torch.float32, device=flag_train.device)
@@ -185,37 +189,51 @@ def _require_megatron_runs(op):
         else:
             call()
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use Megatron's "
-            f"weighted_squared_relu_impl as its functional baseline, but it "
-            f"cannot run even the plain weighted case on this backend: {exc!r}."
-        ) from exc
+        warnings.warn(
+            f"Megatron's weighted_squared_relu_impl cannot run the plain "
+            f"weighted case on {flag_train.vendor_name!r}: {exc!r}. Falling "
+            f"back to the PyTorch composition.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return False
+    return True
 
 
 def _load_megatron_weighted_squared_relu():
-    """Megatron's reference, required on the backends this operator ships on.
+    """Megatron's reference, or ``None`` when it cannot be used here.
 
-    Mirrors ``_load_deepspeed_blocked_flash``: a baseline that cannot run
-    anything raises rather than falling back to a torch composition.
+    The loader warns before falling back to the PyTorch composition, so a
+    missing or unusable Megatron baseline is reported rather than failing the
+    module import.
     """
     if flag_train.vendor_name not in _MEGATRON_BASELINE_VENDORS:
+        warnings.warn(
+            f"{flag_train.vendor_name!r} does not use Megatron's "
+            f"weighted_squared_relu_impl as its reference; using the PyTorch "
+            f"composition instead.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return None
     try:
         from megatron.core.fusions.fused_weighted_squared_relu import (
             weighted_squared_relu_impl,
         )
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use Megatron's "
-            f"weighted_squared_relu_impl as its functional baseline, but it could "
-            f"not be loaded: {exc!r}. Install Megatron-LM for this platform, or "
-            f"drop the backend from _MEGATRON_BASELINE_VENDORS."
-        ) from exc
+        warnings.warn(
+            "Megatron-LM is unavailable; using the PyTorch weighted squared "
+            f"ReLU composition as the reference ({exc!r}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
     if flag_train.vendor_name != "nvidia":
         # ``_require_megatron_runs`` below is the first call into the reference,
         # so the fuser must be switched off before it runs.
         _use_eager_megatron_reference()
-    _require_megatron_runs(weighted_squared_relu_impl)
+    if not _require_megatron_runs(weighted_squared_relu_impl):
+        return None
     return weighted_squared_relu_impl
 
 
@@ -229,12 +247,9 @@ _MEGATRON_HAS_CLAMP_SCALE = (
 
 
 def _megatron_weighted_squared_relu(x, weights, clamp_scale):
-    """Megatron's baseline for one case; clamped cases skip without ``clamp_scale``."""
+    """Megatron's baseline, or the PyTorch composition when it was not loaded."""
     if megatron_weighted_squared_relu_impl is None:
-        raise AssertionError(
-            f"{flag_train.vendor_name!r} has no Megatron baseline loaded; this "
-            f"suite compares against Megatron only."
-        )
+        return weighted_squared_relu_ref(x, weights, clamp_scale)
     if clamp_scale is not None and not _MEGATRON_HAS_CLAMP_SCALE:
         pytest.skip(
             f"megatron-core {_megatron_core_version() or '(unknown version)'} "

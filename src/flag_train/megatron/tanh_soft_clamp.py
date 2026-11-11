@@ -58,4 +58,6 @@ def tanh_soft_clamp(x: torch.Tensor, scale: float) -> torch.Tensor:
             f"tanh_soft_clamp only supports {runtime_device.name} tensors, "
             f"got {x.device.type}"
         )
+    if not x.is_contiguous():
+        x = x.contiguous()
     return _tanh_soft_clamp_kernel(x, float(scale))
