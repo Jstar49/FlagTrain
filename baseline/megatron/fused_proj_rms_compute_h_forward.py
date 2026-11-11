@@ -107,4 +107,38 @@ def build_inputs(binding, dtype, device):
 
 
 def key_shape(binding):
+    # (M, n, K) is unambiguous: N is derived from n.
     return list(binding["shape"])
+
+
+def config(binding, dtype):
+    """Inputs as the benchmark passes them, for the lookup's signature match.
+
+    The collector stores this next to the record; ``--base-data`` uses it to
+    map the runtime tensor signature back to the ``(M, n, K)`` key, because
+    the first tensor ``x`` is ``[M, K]`` and cannot carry ``n``.
+
+    ``build_inputs`` mirrors the benchmark, which passes each alpha as a
+    ``torch.full((1,))`` tensor, so they are shapes rather than scalars: the
+    lookup compares the multiset of tensor shapes exactly.
+    """
+    M, n, K = binding["shape"]
+    N = n * n + 2 * n
+    return {
+        "inputs": {
+            "x": {"shape": [M, K], "dtype": str(dtype)},
+            "weight": {"shape": [N, K], "dtype": "torch.float32"},
+            "alpha_pre": {"shape": [1], "dtype": "torch.float32"},
+            "alpha_post": {"shape": [1], "dtype": "torch.float32"},
+            "alpha_res": {"shape": [1], "dtype": "torch.float32"},
+            "bias": {"shape": [N], "dtype": "torch.float32"},
+            "n": {"scalar": n},
+        },
+        "outputs": {
+            "h_pre": {"shape": [M, n], "dtype": "torch.float32"},
+            "h_post": {"shape": [M, n], "dtype": "torch.float32"},
+            "h_res": {"shape": [M, N - 2 * n], "dtype": "torch.float32"},
+            "r": {"shape": [M, 1], "dtype": "torch.float32"},
+        },
+        "dims": {"M": M, "n": n, "K": K, "N": N},
+    }

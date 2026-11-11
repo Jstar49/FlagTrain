@@ -261,9 +261,12 @@ def config(binding, dtype):
             "proj": {"shape": [M, N], "dtype": matmul_dtype},
             "r": {"shape": [M, 1], "dtype": matmul_dtype},
             "grad_r_ext": {"shape": [M, 1], "dtype": matmul_dtype},
-            "alpha_pre": {"scalar": _GATING_FACTOR},
-            "alpha_post": {"scalar": _GATING_FACTOR},
-            "alpha_res": {"scalar": _GATING_FACTOR},
+            # build_inputs passes each alpha the way the benchmark does, as a
+            # torch.full((1,)) tensor. The lookup matches the runtime tensor
+            # signature exactly, so they are shapes here, not scalars.
+            "alpha_pre": {"shape": [1], "dtype": "torch.float32"},
+            "alpha_post": {"shape": [1], "dtype": "torch.float32"},
+            "alpha_res": {"shape": [1], "dtype": "torch.float32"},
             "bias": {"shape": [N], "dtype": "torch.float32"},
             "n": {"scalar": n},
         },
