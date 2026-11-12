@@ -27,7 +27,10 @@ are never the timed baseline. They mirror the autograd of Megatron's
 
 Shapes, dtypes and the input construction match the forward benchmark; the
 saved ``h_pre`` / ``h_post`` / ``h_res`` / ``proj`` / ``r`` come from the
-FlagTrain forward once per shape, outside the timed region.
+reference forward once per shape, outside the timed region. The public
+FlagTrain forward returns Megatron's four outputs and keeps ``proj`` internal,
+so the benchmark builds it with the same reference that the untimed check
+differentiates.
 
 Precision caveat: the operator's fp32 matmuls use the backend's default
 precision (tf32 on NVIDIA) while the untimed check is IEEE fp32.
@@ -37,11 +40,12 @@ Run::
     pytest benchmark/megatron -m fused_proj_rms_compute_h_backward --level core
 """
 
+import math
+
 import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import fused_proj_rms_compute_h_forward
 
 from .. import base, consts
 
@@ -133,6 +137,42 @@ def _reference_backward(
     )
 
 
+def _reference_forward(
+    x,
+    weight,
+    alpha_pre,
+    alpha_post,
+    alpha_res,
+    bias,
+    n,
+    eps=1e-6,
+    compute_h_eps=1e-6,
+):
+    """Megatron's ``_torch_proj_rms_compute_h`` plus its internal projection.
+
+    Copied from ``megatron/core/fusions/fused_mhc_kernels.py``. The reduced
+    projection is returned as well so the benchmark can feed the backward the
+    same saved tensors the untimed check differentiates; the public FlagTrain
+    forward does not return it.
+    """
+    x = x.to(torch.promote_types(x.dtype, weight.dtype))
+    proj = torch.matmul(x, weight.t())
+    r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
+    alpha = torch.cat(
+        [
+            alpha_pre.expand(n),
+            alpha_post.expand(n),
+            alpha_res.expand(weight.shape[0] - 2 * n),
+        ],
+        dim=-1,
+    )
+    h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
+    h_pre = h[..., :n].sigmoid() + compute_h_eps
+    h_post = h[..., n : 2 * n].sigmoid() * 2
+    h_res = h[..., 2 * n :]
+    return h_pre, h_post, h_res, r, proj
+
+
 def _input_fn(shape, dtype, device):
     M, n, K = shape
     N = n * n + 2 * n
@@ -141,9 +181,16 @@ def _input_fn(shape, dtype, device):
     weight = torch.empty(N, K, dtype=_WEIGHT_DTYPE, device=device).uniform_(-0.1, 0.1)
     alpha = torch.full((1,), 0.01, dtype=torch.float32, device=device)
     bias = torch.zeros(N, dtype=torch.float32, device=device)
-    h_pre, h_post, h_res, r, proj = fused_proj_rms_compute_h_forward(
+    h_pre, h_post, h_res, r, proj = _reference_forward(
         x, weight, alpha, alpha, alpha, bias, n
     )
+    # ``h_res`` is a slice of the reference's [M, N] intermediate; the operator
+    # takes the contiguous saved tensors the forward returns.
+    h_pre = h_pre.contiguous()
+    h_post = h_post.contiguous()
+    h_res = h_res.contiguous()
+    r = r.contiguous()
+    proj = proj.contiguous()
 
     torch.manual_seed(1)
     grad_h_pre = torch.empty(M, n, dtype=h_pre.dtype, device=device).uniform_(-0.1, 0.1)

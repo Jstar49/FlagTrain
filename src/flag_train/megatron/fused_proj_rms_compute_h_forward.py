@@ -55,8 +55,11 @@ and accumulate in fp32. The square sum is always fp32. ``r`` is written in the
 promoted matmul dtype (the reference's dtype) and read back by the epilogue
 kernel, so a low-precision path uses the same rounded ``r`` as the reference.
 
-The reduced projection is returned as well (as Megatron's cuTile forward does)
-because the backward consumes it.
+The reduced projection is computed for the epilogue but is internal: the
+public return is the four outputs of Megatron's ``fused_proj_rms_compute_h``.
+The standalone backward takes the projection as a saved operand, so a caller
+that drives it builds ``x @ weight.T`` alongside the four outputs, outside the
+timed region (the tests and the backward benchmark do this).
 """
 
 import logging
@@ -360,10 +363,11 @@ def fused_proj_rms_compute_h_forward(
         compute_h_eps: added to ``sigmoid(h_pre)`` (default ``1e-6``).
 
     Returns:
-        Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-            ``h_pre`` ``[M, n]``, ``h_post`` ``[M, n]``, ``h_res`` ``[M, n*n]``,
-            ``r`` ``[M, 1]`` and the reduced ``proj`` ``[M, N]`` (kept for the
-            backward, as Megatron's cuTile forward does).
+        Tuple[Tensor, Tensor, Tensor, Tensor]:
+            ``h_pre`` ``[M, n]``, ``h_post`` ``[M, n]``, ``h_res`` ``[M, n*n]``
+            and ``r`` ``[M, 1]`` -- the public outputs of Megatron's
+            ``fused_proj_rms_compute_h``. The reduced projection is internal;
+            a caller of the standalone backward builds it separately.
 
     This is the forward only: it builds no autograd graph, matching Megatron's
     ``_cutile_proj_rms_compute_h_fwd``, which its ``torch.autograd.Function``
@@ -421,7 +425,7 @@ def fused_proj_rms_compute_h_forward(
 
     if M == 0:
         # No launch when there are no rows to map.
-        return h_pre, h_post, h_res, r, proj
+        return h_pre, h_post, h_res, r
 
     norm_m, norm_k, norm_stages = _norm_config(K, x.element_size())
     block_m, block_n, block_k, proj_stages = _proj_config(
@@ -468,4 +472,4 @@ def fused_proj_rms_compute_h_forward(
             num_stages=proj_stages,
         )
 
-    return h_pre, h_post, h_res, r, proj
+    return h_pre, h_post, h_res, r
