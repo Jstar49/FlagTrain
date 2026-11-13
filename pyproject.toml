@@ -43,6 +43,8 @@ ascend = [
 
 thead = [
     "megatron-core==0.17.1",
+    "torch==2.10.0+v0.1.0.ppu2.1.1",
+    "flagtree==0.7.0+ppu3.6",
 ]
 
 # --- END auto-generated from backends.yaml ---
