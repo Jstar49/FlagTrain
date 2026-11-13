@@ -29,6 +29,7 @@ FlagOS runtime image plus `megatron-core`:
 | `hygon-bw1000` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-hygon-dtk26.04:2.2.0-0.2.3` |
 | `iluvatar-BI-V150` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-iluvatar-corex4.5.0:2.2.0-0.2.3` |
 | `mthreads-MTT-S5000` | `harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-mthreads-musa5.2.0:2.2.0-0.2.3` |
+| `thead-ppu-zw810e` | `harbor.baai.ac.cn/flaggems/flaggems-test-thead-ppu-zw810e:20261015` |
 
 Image names and tags are owned by build-infra. The table reflects the
 `2.2.0-0.2.3` release; the current catalog is at

@@ -41,6 +41,10 @@ ascend = [
     "pandas==2.3.2",
 ]
 
+thead = [
+    "megatron-core==0.17.1",
+]
+
 # --- END auto-generated from backends.yaml ---
 
 test = [
