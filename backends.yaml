@@ -41,7 +41,7 @@ backends:
     triton: triton==3.5.0
     # The vllm-ascend image is Python 3.12; 0.7.0 only ships a cp311 wheel, so
     # 0.7.1a1 is the first installable release there.
-    flagtree: flagtree==0.7.1a1+ascend3.5
+    flagtree: flagtree==0.7.0+ascend3.5
     # Install FlagTree into /opt/flagtree even in --prebuilt mode: the image's
     # triton-ascend miscompiles the projection kernel ("Failed to obtain op
     # buffer shape size which should be static"), while FlagTrain's Ascend
