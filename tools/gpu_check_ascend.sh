@@ -20,8 +20,30 @@ mem_threshold=30000     # Minimum free memory required (MB)
 sleep_time=120          # Wait time between retries (seconds)
 max_wait=600           # Maximum total wait time (seconds)
 
+# ``npu-smi`` is part of the host driver, not the CANN toolkit. Container
+# images that do not carry the host's copy (the Ascend CI image on the ARC
+# k8s-novolume runner, which cannot bind-mount /usr/local/sbin/npu-smi) cannot
+# run this check. Skip the idle-NPU wait there; the runner has already assigned
+# the devices to the job, and a missing device still fails the tests.
+NPU_SMI=$(command -v npu-smi 2>/dev/null)
+if [ -z "${NPU_SMI}" ]; then
+    for candidate in \
+        /usr/local/sbin/npu-smi \
+        /usr/local/bin/npu-smi \
+        /usr/local/Ascend/driver/tools/npu-smi; do
+        if [ -x "${candidate}" ]; then
+            NPU_SMI="${candidate}"
+            break
+        fi
+    done
+fi
+if [ -z "${NPU_SMI}" ]; then
+    echo "npu-smi is not available in this environment; skipping the idle-NPU wait."
+    exit 0
+fi
+
 # Get the number of NPU chips from npu-smi info output
-npu_smi_output=$(npu-smi info 2>&1)
+npu_smi_output=$("${NPU_SMI}" info 2>&1)
 
 if [ $? -ne 0 ]; then
     echo "Failed to run npu-smi. Please check if npu-smi is installed and working correctly."
@@ -40,7 +62,7 @@ echo "$npu_smi_output"
 
 waited_time=0
 while true; do
-    npu_smi_output=$(npu-smi info 2>/dev/null)
+    npu_smi_output=$("${NPU_SMI}" info 2>/dev/null)
 
     if [ $? -ne 0 ]; then
         echo "Failed to query NPU information."

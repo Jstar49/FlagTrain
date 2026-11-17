@@ -4,11 +4,14 @@ mirror: "https://mirrors.aliyun.com/pypi/simple"
 # Per-platform version pins. Container jobs run their vendor's image (the
 # FlagOS runtime image for the FlagOS platforms, the vendor's own pytorch image
 # for thead) and tools/setup_env.sh installs these pins on top of it with
-# --no-prebuilt; every backend that calls setup_env uses that mode today, so
-# this file -- not whatever the image happens to ship -- decides the tested
-# stack. Values come from FlagGems' src/flag_gems/backends.yaml and
-# build-infra's configs.yaml / runtime/*.md, and a drift between a pin here and
-# the image is resolved by the pin, because it is installed.
+# --no-prebuilt; ascend uses --prebuilt because its vllm-ascend image already
+# carries the torch/triton stack (the driver comes from the host mounts), so
+# the pins below are not applied there (its post_deps are). For every other
+# backend this file -- not
+# whatever the image happens to ship -- decides the tested stack. Values come
+# from FlagGems' src/flag_gems/backends.yaml and build-infra's
+# configs.yaml / runtime/*.md, and a drift between a pin here and the image is
+# resolved by the pin, because it is installed.
 #
 # `env:` is applied by tools/setup_env.sh with $VAR expanded against the
 # running environment (a value that still holds an unexpanded $VAR after that
@@ -36,7 +39,14 @@ backends:
     python: "3.11"
     cmake_backend: NPU
     triton: triton==3.5.0
-    flagtree: flagtree==0.7.0+ascend3.5
+    # The vllm-ascend image is Python 3.12; 0.7.0 only ships a cp311 wheel, so
+    # 0.7.1a1 is the first installable release there.
+    flagtree: flagtree==0.7.1a1+ascend3.5
+    # Install FlagTree into /opt/flagtree even in --prebuilt mode: the image's
+    # triton-ascend miscompiles the projection kernel ("Failed to obtain op
+    # buffer shape size which should be static"), while FlagTrain's Ascend
+    # kernels are validated against FlagTree.
+    prebuilt_compiler: true
     env_source:
       # Candidates, first existing one wins: CANN's installer has shipped its
       # setup script under both of these. Whichever it is must be sourced --
@@ -70,8 +80,17 @@ backends:
       # pip run as the numpy pin above -- installed separately, pip would pick
       # pandas 3 first and leave an unimportable pair behind.
       - pandas==2.3.2
-      - megatron-core==0.17.1
       - scipy==1.15.3
+
+    # Installed in both --prebuilt and --no-prebuilt modes. The vllm-ascend
+    # image does not carry Megatron, and --prebuilt skips `deps`; without this
+    # the tests' `megatron.core` imports fail during collection. The image's
+    # Python is 3.12, so the latest public release, 0.20.0, is installable.
+    # pandas is the benchmark's profiling fallback, which vLLM's dependency
+    # set does not guarantee.
+    post_deps:
+      # - megatron-core==0.20.0
+      - pandas==2.3.2
 
   hygon:
     python: "3.10"

@@ -312,6 +312,28 @@ jobs:
         with:
           fetch-depth: "1"
 
+      # The FlagOS index is the only source of the large FlagTree wheel, and
+      # the cluster's direct route to it is slow enough that the download never
+      # finishes. Relay the runner's HTTP proxy from repository/organization
+      # variables; when they are unset, leave whatever the runner already
+      # provides untouched.
+      - name: Configure HTTP proxy
+        env:
+          PROXY_HTTP: ${{ vars.HTTP_PROXY }}
+          PROXY_HTTPS: ${{ vars.HTTPS_PROXY }}
+          PROXY_NO: ${{ vars.NO_PROXY }}
+        run: |
+          if [ -n "${PROXY_HTTP}" ]; then
+            { echo "http_proxy=${PROXY_HTTP}"; echo "HTTP_PROXY=${PROXY_HTTP}"; } >>"${GITHUB_ENV}"
+          fi
+          if [ -n "${PROXY_HTTPS}" ]; then
+            { echo "https_proxy=${PROXY_HTTPS}"; echo "HTTPS_PROXY=${PROXY_HTTPS}"; } >>"${GITHUB_ENV}"
+          fi
+          if [ -n "${PROXY_NO}" ]; then
+            { echo "no_proxy=${PROXY_NO}"; echo "NO_PROXY=${PROXY_NO}"; } >>"${GITHUB_ENV}"
+          fi
+          echo "http proxy configured: $([ -n "${PROXY_HTTPS}${PROXY_HTTP}" ] && echo yes || echo no)"
+
       - name: Install FlagTrain and the test dependencies
         run: |
           # No venv is created here, and none should be: the job already runs
@@ -431,6 +453,24 @@ jobs:
       - uses: flagos-ai/FlagTrain/.github/actions/checkout-retry@main
         with:
           fetch-depth: "1"
+
+      - name: Configure HTTP proxy
+        shell: bash
+        env:
+          PROXY_HTTP: ${{ vars.HTTP_PROXY }}
+          PROXY_HTTPS: ${{ vars.HTTPS_PROXY }}
+          PROXY_NO: ${{ vars.NO_PROXY }}
+        run: |
+          if [ -n "${PROXY_HTTP}" ]; then
+            { echo "http_proxy=${PROXY_HTTP}"; echo "HTTP_PROXY=${PROXY_HTTP}"; } >>"${GITHUB_ENV}"
+          fi
+          if [ -n "${PROXY_HTTPS}" ]; then
+            { echo "https_proxy=${PROXY_HTTPS}"; echo "HTTPS_PROXY=${PROXY_HTTPS}"; } >>"${GITHUB_ENV}"
+          fi
+          if [ -n "${PROXY_NO}" ]; then
+            { echo "no_proxy=${PROXY_NO}"; echo "NO_PROXY=${PROXY_NO}"; } >>"${GITHUB_ENV}"
+          fi
+          echo "http proxy configured: $([ -n "${PROXY_HTTPS}${PROXY_HTTP}" ] && echo yes || echo no)"
 
       - name: Create the test environment
         shell: bash

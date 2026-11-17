@@ -46,6 +46,12 @@
 
 set -euo pipefail
 
+# pip resumes a dropped download in place, but its default ceiling is 5
+# resumes (6 tries). The link to the vendor index drops mid-stream on the CN
+# runners, which is not enough for the multi-hundred-MB compiler wheels;
+# build-infra's runtime image sets this for the same reason.
+export PIP_RESUME_RETRIES="${PIP_RESUME_RETRIES:-100}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKENDS_YAML="${REPO_ROOT}/backends.yaml"
 
@@ -91,7 +97,9 @@ emit_env() {
 FLAGOS_PYPI=""
 MIRROR=""
 DEPS=""
+POST_DEPS=""
 COMPILER_PKG=""
+PRECOMPILER=0
 ENV_SOURCES=""
 sourced_env=""
 
@@ -100,7 +108,9 @@ while IFS=$'\t' read -r kind a b; do
         PYPI) FLAGOS_PYPI="${a}" ;;
         MIRROR) MIRROR="${a}" ;;
         DEP) DEPS="${DEPS} ${a}" ;;
+        POSTDEP) POST_DEPS="${POST_DEPS} ${a}" ;;
         COMPILER) COMPILER_PKG="${a}" ;;
+        PRECOMPILER) PRECOMPILER=1 ;;
         SOURCE) ENV_SOURCES="${ENV_SOURCES} ${a}" ;;
         ENV)
             echo "backend env ${a}=${b}"
@@ -135,6 +145,10 @@ if cfg.get("mirror"):
     print("MIRROR\t" + cfg["mirror"])
 for dep in backend.get("deps", []):
     print("DEP\t" + dep)
+# post_deps are installed in both modes: a prebuilt image may ship an older
+# copy of an app/reference package, or miss a package FlagTrain's tests import.
+for dep in backend.get("post_deps", []):
+    print("POSTDEP\t" + dep)
 # FlagTree is the preferred compiler where a backend has one; otherwise the
 # backend's Triton package. Installed only with --no-prebuilt, since a
 # prebuilt image already carries one of them and installing the other would
@@ -142,6 +156,11 @@ for dep in backend.get("deps", []):
 compiler_pkg = backend.get("flagtree") or backend.get("triton")
 if compiler_pkg:
     print("COMPILER\t" + compiler_pkg)
+# prebuilt_compiler: install the compiler into /opt/flagtree even in
+# --prebuilt mode, for an image whose bundled Triton compiler cannot build
+# FlagTrain's kernels.
+if backend.get("prebuilt_compiler"):
+    print("PRECOMPILER\t1")
 for source in backend.get("env_source", []):
     print("SOURCE\t" + source)
 # $VARs are expanded against the running environment plus whatever this same
@@ -214,13 +233,43 @@ if [ -n "${sourced_env}" ]; then
     done
 fi
 
-pip_args=(--no-cache-dir)
+# A slow link to the vendor index needs more than pip's 15 s socket timeout;
+# the resume ceiling set at the top of this script handles the drops.
+if [ -n "${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}" ]; then
+    echo "http proxy: configured"
+else
+    echo "http proxy: not set; downloads from the FlagOS index may be slow"
+fi
+
+pip_args=(--no-cache-dir --timeout 120)
 if [ -n "${FLAGOS_PYPI}" ]; then
     pip_args+=(--index-url "${FLAGOS_PYPI}")
 fi
 if [ -n "${MIRROR}" ]; then
     pip_args+=(--extra-index-url "${MIRROR}")
 fi
+
+# Record what the image already provides before installing anything. A FlagOS
+# runtime image keeps FlagTree in /opt/flagtree (not site-packages), so the pip
+# view alone is not enough; report that directory and the active triton module
+# too, which is what actually compiles the kernels.
+echo "pre-install check:"
+if python3 -m pip show flagtree >/dev/null 2>&1; then
+    python3 -m pip show flagtree | sed -n '1,8p'
+else
+    echo "  flagtree: not installed in the current Python environment"
+fi
+if [ -d /opt/flagtree ]; then
+    echo "  /opt/flagtree: present"
+fi
+python3 - <<'PY' 2>/dev/null || true
+try:
+    import triton
+
+    print(f"  triton: {triton.__version__} ({triton.__file__})")
+except Exception as exc:
+    print(f"  triton: unavailable ({exc!r})")
+PY
 
 # setuptools>=77 is the repo's build requirement (PEP 639 metadata); install it
 # first so `--no-build-isolation` below has a backend to use.
@@ -253,10 +302,35 @@ if [ "${PREBUILT}" -eq 0 ]; then
     fi
 fi
 
+# prebuilt_compiler: keep the image's torch stack but replace its Triton
+# compiler. Installed into /opt/flagtree and prepended to PYTHONPATH, the same
+# layout build-infra's runtime image uses, so the image's own triton is left
+# untouched.
+if [ "${PREBUILT}" -eq 1 ] && [ "${PRECOMPILER}" -eq 1 ] && [ -n "${COMPILER_PKG}" ]; then
+    echo "installing ${BACKEND} compiler into /opt/flagtree (${COMPILER_PKG})"
+    mkdir -p /opt/flagtree
+    # shellcheck disable=SC2086
+    python3 -m pip install "${pip_args[@]}" --upgrade --target /opt/flagtree ${COMPILER_PKG}
+    if [ -n "${PYTHONPATH:-}" ]; then
+        emit_env "PYTHONPATH=/opt/flagtree:${PYTHONPATH}"
+    else
+        emit_env "PYTHONPATH=/opt/flagtree"
+    fi
+fi
+
+# post_deps run in both modes. They carry a package a prebuilt image does not
+# ship (ascend's megatron-core) and anything `deps` would otherwise provide
+# only when the image lacks the vendor stack.
+if [ -n "${POST_DEPS}" ]; then
+    echo "installing ${BACKEND} post-deps (${POST_DEPS# })"
+    # shellcheck disable=SC2086
+    python3 -m pip install "${pip_args[@]}" ${POST_DEPS}
+fi
+
 # FlagTrain plus its test dependencies, as declared in pyproject.toml's
 # `[test]` extra (pytest only). The reference packages the tests import
-# (megatron-core) are declared in `deps:` above, next to the vendor stack, and
-# are installed only with --no-prebuilt -- the mode every backend uses today.
+# (megatron-core) come from `deps:` and `post_deps:` above; with --prebuilt
+# only `post_deps:` is installed.
 # pyyaml/sqlalchemy/numpy/packaging come from the package's core dependencies.
 python3 -m pip install "${pip_args[@]}" --no-build-isolation -e "${REPO_ROOT}[test]"
 

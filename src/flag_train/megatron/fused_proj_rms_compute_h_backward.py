@@ -13,8 +13,9 @@
 # limitations under the License.
 """Backward of Megatron's fused projection + RMS + compute_h mHC mapping.
 
-Forward (``fused_proj_rms_compute_h_forward``) returns ``h_pre``, ``h_post``,
-``h_res``, ``r`` and the reduced ``proj``. With upstream gradients
+The public forward ``fused_proj_rms_compute_h_forward`` returns Megatron's four
+outputs and keeps the reduced projection internal; the caller saves that
+projection and passes it here as ``proj``. With upstream gradients
 ``grad_h_pre``, ``grad_h_post``, ``grad_h_res`` and optionally ``grad_r``::
 
     s_pre    = sigmoid(h_linear[:, :n])          = h_pre - compute_h_eps
@@ -491,7 +492,8 @@ def fused_proj_rms_compute_h_backward(
         h_pre: ``[M, n]`` forward output.
         h_post: ``[M, n]`` forward output.
         h_res: ``[M, n * n]`` forward output.
-        proj: ``[M, N]`` reduced projection returned by the forward.
+        proj: ``[M, N]`` reduced projection ``x @ weight.T``, saved by the
+            caller; the public forward keeps it internal.
         r: ``[M, 1]`` RMS scale returned by the forward.
         grad_r_ext: ``[M, 1]`` gradient of ``r``, or ``None``.
         alpha_pre: single-element tensor scaling the first ``n`` columns.
