@@ -302,19 +302,40 @@ if [ "${PREBUILT}" -eq 0 ]; then
     fi
 fi
 
-# prebuilt_compiler: keep the image's torch stack but replace its Triton
-# compiler. Installed into /opt/flagtree and prepended to PYTHONPATH, the same
-# layout build-infra's runtime image uses, so the image's own triton is left
-# untouched.
+# prebuilt_compiler: keep the image's torch stack but make the requested
+# Triton compiler the one the tests import. If the image already ships that
+# exact version, reuse it -- pip's --target would otherwise re-download the
+# 543 MB wheel into /opt/flagtree even though the same distribution is
+# installed. Otherwise install it into /opt/flagtree and prepend that to
+# PYTHONPATH, the same layout build-infra's runtime image uses.
 if [ "${PREBUILT}" -eq 1 ] && [ "${PRECOMPILER}" -eq 1 ] && [ -n "${COMPILER_PKG}" ]; then
-    echo "installing ${BACKEND} compiler into /opt/flagtree (${COMPILER_PKG})"
-    mkdir -p /opt/flagtree
-    # shellcheck disable=SC2086
-    python3 -m pip install "${pip_args[@]}" --upgrade --target /opt/flagtree ${COMPILER_PKG}
-    if [ -n "${PYTHONPATH:-}" ]; then
-        emit_env "PYTHONPATH=/opt/flagtree:${PYTHONPATH}"
+    compiler_name="${COMPILER_PKG%%==*}"
+    compiler_want="${COMPILER_PKG#*==}"
+    compiler_have=""
+    if [ "${compiler_name}" != "${COMPILER_PKG}" ]; then
+        compiler_have=$(python3 -m pip show "${compiler_name}" 2>/dev/null \
+            | awk '/^Version:/ {print $2; exit}')
+    fi
+    if [ -z "${compiler_have}" ] && [ -d /opt/flagtree ]; then
+        compiler_have=$(PYTHONPATH="/opt/flagtree${PYTHONPATH:+:${PYTHONPATH}}" \
+            python3 -m pip show "${compiler_name}" 2>/dev/null \
+            | awk '/^Version:/ {print $2; exit}')
+        if [ -n "${compiler_have}" ]; then
+            emit_env "PYTHONPATH=/opt/flagtree${PYTHONPATH:+:${PYTHONPATH}}"
+        fi
+    fi
+    if [ -n "${compiler_have}" ] && [ "${compiler_have}" = "${compiler_want}" ]; then
+        echo "${compiler_name} ${compiler_have} is already installed; using the image's copy"
     else
-        emit_env "PYTHONPATH=/opt/flagtree"
+        echo "installing ${BACKEND} compiler into /opt/flagtree (${COMPILER_PKG})"
+        mkdir -p /opt/flagtree
+        # shellcheck disable=SC2086
+        python3 -m pip install "${pip_args[@]}" --upgrade --target /opt/flagtree ${COMPILER_PKG}
+        if [ -n "${PYTHONPATH:-}" ]; then
+            emit_env "PYTHONPATH=/opt/flagtree:${PYTHONPATH}"
+        else
+            emit_env "PYTHONPATH=/opt/flagtree"
+        fi
     fi
 fi
 
