@@ -26,13 +26,13 @@
     "gpu_check": "tools/gpu_check_ascend.sh",
     "label_gated": true,
     "prebuilt_env": true,
-    "enabled": true,
+    "enabled": false,
     "container": {
       "image": "harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-ascend-cann9.0.0-910c:2.2.0-0.2.3",
       "options": "--ipc=host --privileged --device=/dev/davinci_manager --device=/dev/devmm_svm --device=/dev/hisi_hdc -v /usr/local/Ascend/driver:/usr/local/Ascend/driver -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi",
       "runs_on": "flagcicd-910c"
     },
-    "note": "Container job on the 910C ARC runner (flagcicd-910c) using the vllm-ascend image that FlagGems-vllm already pulls on this runner: it is available through m.daocloud.io and cached on the nodes, unlike the FlagOS app image, whose first pull stalls in 'pulling fs layer'. The host mounts supply the driver userspace (/usr/local/Ascend/driver, /usr/local/dcmi) and npu-smi, which the image does not carry. prebuilt_env is true so the image's torch stack is kept, but prebuilt_compiler installs FlagTree into /opt/flagtree (ahead of the image's triton on PYTHONPATH) because the image's triton-ascend miscompiles the projection kernel. setup_env.sh also sets PIP_RESUME_RETRIES so the large FlagTree wheel survives the vendor index's mid-stream drops, and installs megatron-core/pandas as post_deps."
+    "note": "Temporarily disabled (enabled=false): the 910C path is still being brought up (image pull, FlagTree compiler) and should not gate PRs. Flip enabled back to true when it is ready. Container job on the 910C ARC runner (flagcicd-910c) using the FlagOS Megatron app image, with the host driver userspace (/usr/local/Ascend/driver, /usr/local/dcmi) and npu-smi bind-mounted; prebuilt_env keeps the image's torch/flagtree stack and setup_env.sh's post_deps adds the test packages."
   },
   {
     "backend": "hygon",
