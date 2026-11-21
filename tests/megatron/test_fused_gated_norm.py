@@ -375,6 +375,11 @@ def test_fused_gated_norm_rejects_invalid_input(bad_input, match):
     contract: no FP32 activation, no gate outside ``x.dtype``/FP32, and no
     weight outside BF16/FP16/FP32.
     """
+    # A device without FP64 (torch_npu) silently casts ``.to(torch.float64)`` to
+    # FP32, which the contract admits, so there is no invalid operand to build.
+    if bad_input in ("gate-dtype", "weight-dtype") and not utils.fp64_is_supported:
+        pytest.skip("device has no FP64; .to(torch.float64) degrades to FP32")
+
     x, gate, weight = _operands(_SHAPE, torch.float16)
     if bad_input == "x-ndim":
         x, gate = x.reshape(-1, 4, 64), gate.reshape(-1, 4, 64)
