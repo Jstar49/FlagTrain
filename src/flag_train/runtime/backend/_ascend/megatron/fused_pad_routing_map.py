@@ -91,6 +91,11 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.megatron.fused_pad_routing_map import (
+    _cast_to_kernel_dtype,
+    _empty_experts_result,
+    _pad_multiple_int,
+)
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 
@@ -513,31 +518,57 @@ def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch
     """Pad every expert column of a routing map to a multiple of ``pad_multiple``.
 
     Args:
-        routing_map (Tensor): boolean or integer map of shape ``[num_tokens,
-            num_experts]``; a non-contiguous view is accepted. It is not
-            modified.
+        routing_map (Tensor): boolean, integer or floating map of shape
+            ``[num_tokens, num_experts]``; a non-contiguous view is accepted. It
+            is not modified. As upstream does, any dtype torch can cast to int32
+            is accepted (complex drops its imaginary part, fp8 converts).
         pad_multiple (int): the alignment each expert's token count must reach.
+            Upstream's kernel takes it as a constexpr, so bools, numpy integers
+            and whole floats reach it; those forms are accepted here too. A
+            non-positive or non-whole value is rejected -- upstream's behaviour
+            there (modulo zero, or a negative alignment) is undefined and is not
+            reproduced.
 
     Returns:
         Tensor: the padded map as an ``int32`` transposed view of a contiguous
-            ``[num_experts, num_tokens]`` buffer. For ``num_tokens == 0`` the
-            argument itself is returned, unchanged.
+            ``[num_experts, num_tokens]`` buffer, with ``stride == (1,
+            num_tokens)``. For ``num_tokens == 0`` the argument itself is
+            returned, unchanged. For ``num_experts == 0`` an empty ``int32``
+            tensor is returned with upstream's zero-size strides.
     """
     logger.debug("TRAIN_ASCEND FUSED_PAD_ROUTING_MAP")
-    assert routing_map.dim() == 2, (
-        "fused_pad_routing_map expects a [num_tokens, num_experts] tensor, "
-        f"got shape {tuple(routing_map.shape)}"
-    )
-    assert (
-        routing_map.device.type == runtime_device.name
-    ), f"fused_pad_routing_map only supports {runtime_device.name} tensors"
-    assert (
-        isinstance(pad_multiple, int) and pad_multiple > 0
-    ), f"pad_multiple must be a positive int, got {pad_multiple!r}"
+    if routing_map.dim() != 2:
+        # Upstream unpacks ``shape`` directly, so a bad rank is a ValueError.
+        raise ValueError(
+            "fused_pad_routing_map expects a [num_tokens, num_experts] tensor, "
+            f"got shape {tuple(routing_map.shape)}"
+        )
 
     num_tokens, num_experts = routing_map.shape
+    # Upstream returns before touching device or pad_multiple when there are no
+    # tokens; keep that ordering so an empty input behaves identically.
     if num_tokens == 0:
         return routing_map
+
+    pad = _pad_multiple_int(pad_multiple)
+    # Upstream's grid is empty when there are no experts, so its kernel -- and
+    # with it any device or pad_multiple check -- never runs. Keep that ordering
+    # and its zero-size result, strides included.
+    if num_experts == 0:
+        return _empty_experts_result(routing_map)
+
+    if routing_map.device.type != runtime_device.name:
+        raise ValueError(
+            f"fused_pad_routing_map only supports {runtime_device.name} tensors"
+        )
+    assert (
+        pad == pad_multiple
+    ), f"pad_multiple must be a whole number, got {pad_multiple!r}"
+    assert pad > 0, f"pad_multiple must be positive, got {pad_multiple!r}"
+
+    # Upstream casts every input to int32 before its kernel; the fused path does
+    # it only for the dtypes Triton cannot load (complex, fp8).
+    routing_map = _cast_to_kernel_dtype(routing_map)
 
     # Both kernels index the map as a dense [tokens, experts] array; a view
     # with another layout is densified once rather than read strided.
@@ -547,8 +578,6 @@ def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch
     output_map = torch.empty(
         (num_experts, num_tokens), dtype=torch.int32, device=routing_map.device
     )
-    if num_experts == 0:
-        return output_map.transpose(0, 1)
 
     config = _run_config(num_tokens, num_experts)
     num_tiles = config["num_tiles"]
@@ -606,18 +635,18 @@ def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch
                 partials,
                 num_tokens,
                 num_tiles,
-                pad_multiple,
+                pad,
                 PARTIAL_BLOCK=partial_block,
                 CHUNK=_FLIP_FIRST_BLOCK,
                 num_warps=_KERNEL_WARPS,
             )
-        elif pad_multiple <= _SMALL_ALIGN_MAX:
+        elif pad <= _SMALL_ALIGN_MAX:
             _flip_prefix_kernel[(num_experts,)](
                 output_map,
                 partials,
                 num_tokens,
                 num_tiles,
-                pad_multiple,
+                pad,
                 PARTIAL_BLOCK=partial_block,
                 FIRST_BLOCK=_FLIP_FIRST_BLOCK,
                 BLOCK=_FLIP_BLOCK,
@@ -634,7 +663,7 @@ def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch
                 partials,
                 num_tokens,
                 num_tiles,
-                pad_multiple,
+                pad,
                 PARTIAL_BLOCK=partial_block,
                 CHUNK=chunk,
                 GROUPS=chunk // _HIER_SCAN_LANES,

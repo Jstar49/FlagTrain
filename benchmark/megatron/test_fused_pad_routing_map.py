@@ -35,15 +35,18 @@ belongs to the tests, and this file only times the kernel.
 
 The baseline takes the same ``(routing_map, pad_multiple)`` tuple as the
 operator, so there is nothing to pre-compute outside the timed region. The input
-is a boolean top-k map -- the operator's real input in Megatron's MoE dispatcher
--- and both sides return int32 ``[num_tokens, num_experts]``.
+is a top-k map -- boolean, the operator's real input in Megatron's MoE
+dispatcher, and also int32, the same map after the cast a dispatcher may already
+have applied (which takes the integer counting path) -- and both sides return
+int32 ``[num_tokens, num_experts]``.
 
-The shapes are deployments rather than bare tensor sizes: each row of
-``_PAD_ROUTING_MAP_CONFIGS`` is a real model's expert count and top-k, the token
-count it feeds through one dispatch, and the alignment its quantization path
-asks for (Megatron's ``get_align_size_for_quantization``: 256 for TE's
-grouped-tensor MLP, 16 for blockwise FP8, 32 for MXFP8/FP4). One synthetic row
-crosses the kernel's tile boundary.
+Most rows of ``_PAD_ROUTING_MAP_CONFIGS`` are deployments rather than bare tensor
+sizes: a real model's expert count and top-k, the token count it feeds through
+one dispatch, and the alignment its quantization path asks for (Megatron's
+``get_align_size_for_quantization``: 256 for TE's grouped-tensor MLP, 16 for
+blockwise FP8, 32 for MXFP8/FP4). Synthetic rows add the axes the deployments do
+not cover: tile boundaries, a ragged expert tile, a launch-bound map, and a row
+long enough to walk the partial-count sum more than once.
 """
 
 import importlib.metadata
@@ -65,8 +68,18 @@ from .. import base
 # for that deployment: 256 for TE's grouped-tensor MLP, 16 for blockwise FP8,
 # 32 for MXFP8 and FP4. ``num_tokens`` spans one micro-batch of Megatron's own
 # MoE performance proxies (4096) through the larger maps the same models feed in
-# production. The last row is synthetic: a non-power-of-two row that still fits
+# production. The 4097 row is synthetic: a non-power-of-two row that still fits
 # one masked tile, next to the multi-tile paths the 16K/32K rows walk.
+#
+# The remaining synthetic rows cover axes the deployments do not: a
+# non-power-of-two expert count whose last expert tile is masked, a row long
+# enough to walk the partial-count sum more than once, and two decode-sized
+# dispatches. The decode rows were added after the cross-hardware records were
+# taken, so ``vs Base`` reports them as missing until
+# ``tools/op_flagtrain_perf_baseline.json`` is regenerated; their latency is
+# measured either way. One token reaches the single-chunk flip path and a
+# 128-token micro-batch the small one -- neither is exercised by the deployment
+# rows above, which start at 4096 tokens.
 _PAD_ROUTING_MAP_CONFIGS = [
     (4096, 8, 2, 256),  # Mixtral 8x7B (Megatron's MIXTRAL_PROXY), TE grouped MLP
     (16384, 8, 2, 256),  # Mixtral, four micro-batches
@@ -77,6 +90,10 @@ _PAD_ROUTING_MAP_CONFIGS = [
     (32768, 8, 2, 256),  # Mixtral, a large dispatch map
     (32768, 256, 8, 256),  # DeepSeek-V3's full 256-expert map
     (4097, 64, 8, 256),  # synthetic: non-power-of-two row, one masked tile
+    (4096, 48, 8, 32),  # synthetic: non-power-of-two expert tile
+    (131073, 8, 2, 32),  # synthetic: 1025 transpose tiles, partial-count loop
+    (1, 64, 8, 32),  # decode: one token, the single-chunk flip
+    (128, 64, 8, 32),  # decode: one micro-batch
 ]
 
 # ---------------------------------------------------------------------------
@@ -138,6 +155,14 @@ _BASELINE = (
 )
 
 
+# The dtypes timed. bool is the dispatcher's map and the reference record set;
+# int32 is the same map after the cast a dispatcher may already have applied,
+# and it takes the integer counting path (fp32 accumulation is the boolean
+# one). Its rows have no cross-hardware record yet, so ``vs Base`` reports them
+# missing until the baseline file is regenerated.
+_DTYPES = [torch.bool, torch.int32]
+
+
 class PadRoutingMapBenchmark(base.GenericBenchmark):
     DEFAULT_SHAPES = _PAD_ROUTING_MAP_CONFIGS
     DEFAULT_SHAPE_DESC = "num_tokens, num_experts, top_k, pad_multiple"
@@ -154,7 +179,7 @@ class PadRoutingMapBenchmark(base.GenericBenchmark):
         return ["gbps"]
 
     def get_gbps(self, args, latency):
-        """Boundary traffic: read the bool map, write the int32 padded map.
+        """Boundary traffic: read the input map, write the int32 padded map.
 
         The operator's internal ``.int()`` working copy is not counted, so this
         is the I/O the contract implies rather than every byte the kernels move.
@@ -164,8 +189,8 @@ class PadRoutingMapBenchmark(base.GenericBenchmark):
         return io_bytes * 1e-9 / (latency * 1e-3)
 
 
-def _make_routing_map(num_tokens, num_experts, top_k, device=None):
-    """A boolean top-k routing map, the operator's real input.
+def _make_routing_map(num_tokens, num_experts, top_k, dtype=torch.bool, device=None):
+    """A top-k routing map, in the dispatcher's bool form or its int32 form.
 
     Logits are independent uniform draws exactly as a router's would be before
     training; the map keeps the top ``top_k`` per token, so expert loads are
@@ -177,12 +202,14 @@ def _make_routing_map(num_tokens, num_experts, top_k, device=None):
     indices = logits.topk(min(top_k, num_experts), dim=-1).indices
     routing_map = torch.zeros(shape, dtype=torch.bool, device=device)
     routing_map.scatter_(1, indices, True)
-    return routing_map
+    return routing_map.to(dtype)
 
 
 def pad_routing_map_input_fn(shape, dtype, device):
     num_tokens, num_experts, top_k, pad_multiple = shape
-    yield _make_routing_map(num_tokens, num_experts, top_k, device), pad_multiple
+    yield _make_routing_map(
+        num_tokens, num_experts, top_k, dtype=dtype, device=device
+    ), pad_multiple
 
 
 def train_op(routing_map, pad_multiple):
@@ -200,8 +227,9 @@ def test_fused_pad_routing_map_perf():
         # None off the vendored backends: a torch composition is not timed as
         # a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
-        # The dispatcher's map is boolean, so that is the contract measured here.
-        dtypes=[torch.bool],
+        # bool is the dispatcher's map; int32 is the same map after its cast and
+        # takes the integer counting path.
+        dtypes=_DTYPES,
     )
     bench.set_train(train_op)
     bench.run()

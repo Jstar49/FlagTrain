@@ -20,9 +20,10 @@ Self-contained module; depends only on torch and megatron, and does not import
 Triton ``_pad_routing_map_kernel`` FlagTrain's operator ports -- and raises when
 Megatron is unavailable instead of falling back to a torch composition.
 
-Shapes, the boolean top-k input construction and the single measured dtype are
-copied from ``FlagTrain/benchmark/megatron/test_fused_pad_routing_map.py``.
-Each shape is a deployment ``(num_tokens, num_experts, top_k, pad_multiple)``.
+Shapes, the top-k input construction and the measured dtype sweep are copied
+from ``FlagTrain/benchmark/megatron/test_fused_pad_routing_map.py``. Each shape
+is a deployment or synthetic boundary case
+``(num_tokens, num_experts, top_k, pad_multiple)``.
 
 Megatron decorates the function with ``@jit_fuser`` (``torch.compile``). Like
 ``quick_gelu.py`` this module disables the fuser and unwraps the original
@@ -34,11 +35,12 @@ first ``native()`` call, so ops discovery does not trigger it.
 import torch
 
 OP_NAME = "fused_pad_routing_map"
-DTYPES = [torch.bool]
+DTYPES = [torch.bool, torch.int32]
 IS_INPLACE = False
 
 # benchmark/megatron/test_fused_pad_routing_map.py::_PAD_ROUTING_MAP_CONFIGS
-# (num_tokens, num_experts, top_k, pad_multiple)
+# (num_tokens, num_experts, top_k, pad_multiple). Keep this list, the dtype
+# sweep and the input construction in sync with that file.
 _SHAPES = [
     (4096, 8, 2, 256),
     (16384, 8, 2, 256),
@@ -49,6 +51,10 @@ _SHAPES = [
     (32768, 8, 2, 256),
     (32768, 256, 8, 256),
     (4097, 64, 8, 256),
+    (4096, 48, 8, 32),
+    (131073, 8, 2, 32),
+    (1, 64, 8, 32),
+    (128, 64, 8, 32),
 ]
 
 _MEGATRON_FUSED_PAD_ROUTING_MAP = None
@@ -98,19 +104,19 @@ def grid():
     return [{"shape": shape} for shape in _SHAPES]
 
 
-def _make_routing_map(num_tokens, num_experts, top_k, device):
-    """A boolean top-k routing map, as the benchmark builds it."""
+def _make_routing_map(num_tokens, num_experts, top_k, dtype, device):
+    """A top-k routing map in ``dtype``, as the benchmark builds it."""
     shape = (num_tokens, num_experts)
     logits = torch.randn(shape, dtype=torch.float32, device=device)
     indices = logits.topk(min(top_k, num_experts), dim=-1).indices
     routing_map = torch.zeros(shape, dtype=torch.bool, device=device)
     routing_map.scatter_(1, indices, True)
-    return routing_map
+    return routing_map.to(dtype)
 
 
 def build_inputs(binding, dtype, device):
     num_tokens, num_experts, top_k, pad_multiple = binding["shape"]
-    routing_map = _make_routing_map(num_tokens, num_experts, top_k, device)
+    routing_map = _make_routing_map(num_tokens, num_experts, top_k, dtype, device)
     return (routing_map, pad_multiple), {}
 
 
@@ -129,6 +135,12 @@ def config(binding, dtype):
                 "dtype": str(dtype),
             },
             "pad_multiple": {"scalar": pad_multiple},
+        },
+        "outputs": {
+            "out": {
+                "shape": [num_tokens, num_experts],
+                "dtype": "torch.int32",
+            },
         },
         "dims": {
             "num_tokens": num_tokens,
