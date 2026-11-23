@@ -14,17 +14,17 @@
 
 """Opt-in support for running an explicit reference as the candidate.
 
-Correctness tests opt in by calling :func:`get_candidate` with the reference
-they already trust. Benchmarks opt in through their shared timing path, which
-selects the benchmark's explicit ``torch_op``. Both paths call the single
-:func:`select_candidate`, so there is one definition of what
-``--ref-as-candidate`` changes.
+Correctness tests declare a module-level ``reference``. The pytest plugin
+temporarily installs it at the public operator entry point for the test call.
+Benchmarks use their explicit ``torch_op`` through the shared timing path.
+Both paths use :func:`select_candidate` to observe candidate-side calls.
 
 This module is imported only by the pytest/benchmark integration. Importing
 ``flag_train`` itself must not require pytest.
 """
 
 import importlib
+import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -32,6 +32,8 @@ from functools import wraps
 from pathlib import Path
 
 import pytest
+
+from .dynamic_registry import OverrideResolutionError, resolve_operator_target
 
 _MODE = ContextVar("flag_train_reference_candidate_mode", default=None)
 
@@ -159,6 +161,13 @@ def get_candidate(operator_path, *, reference=None):
     works even when the candidate export is absent. In the default mode the
     live public attribute is returned, including any CLI override.
     """
+    warnings.warn(
+        "get_candidate() is deprecated. To migrate, define a callable named "
+        "reference in the test module and call the public operator entry point. "
+        "--ref-as-candidate installs the reference automatically.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if reference_mode_enabled():
         return select_candidate(None, reference, operator_path)
     candidate = _resolve_public_candidate(operator_path)
@@ -216,9 +225,9 @@ def add_reference_candidate_argument(parser):
             action="store_true",
             default=False,
             help=(
-                "Run the explicit reference supplied by each correctness test "
-                "as the candidate, and time the benchmark's explicit torch_op "
-                "as the candidate. Requires an explicit reference."
+                "Run the correctness test module's explicit reference as the "
+                "public operator, and time the benchmark's explicit torch_op "
+                "as the candidate."
             ),
         )
     except ValueError:
@@ -237,6 +246,67 @@ def configure_reference_candidate(config):
     config.pluginmanager.register(plugin, "flag-train-reference-candidate")
 
 
+def _test_operator_target(item):
+    module = item.module
+    if hasattr(module, "OVERRIDE_KEY"):
+        return resolve_operator_target(module.OVERRIDE_KEY)
+
+    component = item.path.parent.name
+    prefix = f"{component}." if component in _OPERATOR_ROOTS else ""
+    if hasattr(module, "OP_NAME"):
+        name = module.OP_NAME
+        if isinstance(name, str) and "." not in name:
+            name = prefix + name
+        return resolve_operator_target(name)
+
+    def exported_target(name):
+        target = resolve_operator_target(f"{prefix}{name}")
+        owner = importlib.import_module(target.module_name)
+        return target if callable(vars(owner).get(target.attr_name)) else None
+
+    targets = {
+        target
+        for mark in item.iter_markers()
+        if (target := exported_target(mark.name)) is not None
+    }
+    if len(targets) > 1:
+        raise OverrideResolutionError(
+            "Multiple public operators match the test marks. Declare OVERRIDE_KEY."
+        )
+    if targets:
+        return targets.pop()
+
+    filename = item.path.stem
+    if filename.startswith("test_"):
+        target = exported_target(filename.removeprefix("test_"))
+        if target is not None:
+            return target
+
+    if prefix and filename.startswith("test_"):
+        # A conventional component test may validate a reference before its
+        # public candidate has been added to the package.
+        return resolve_operator_target(prefix + filename.removeprefix("test_"))
+    return None
+
+
+def _patch_test_reference(item, patch, target):
+    reference = getattr(item.module, "reference", None)
+
+    def missing_reference(*args, **kwargs):
+        raise ReferenceContractError(
+            f"{item.nodeid}: No predefined reference for {target.full_name}. "
+            "Define a callable reference in the test module."
+        )
+
+    owner = importlib.import_module(target.module_name)
+    candidate = (
+        select_candidate(None, reference, target.full_name)
+        if callable(reference)
+        else missing_reference
+    )
+    patch.setattr(owner, target.attr_name, candidate, raising=False)
+
+
 class _ReferenceCandidatePlugin:
     """Per-case lifecycle shared by correctness and benchmark nodes."""
 
@@ -253,7 +323,22 @@ class _ReferenceCandidatePlugin:
 
     def pytest_collection_finish(self, session):
         for item in session.items:
-            self.records[item.nodeid] = {"status": "NOT_RUN", "calls": 0}
+            target = None
+            target_error = None
+            if isinstance(item, pytest.Function):
+                try:
+                    target = _test_operator_target(item)
+                except OverrideResolutionError as error:
+                    target_error = str(error)
+            phase = "correctness" if self._is_correctness(item) else "benchmark"
+            operator = target.full_name if target else item.nodeid.split("::", 1)[0]
+            self.records[item.nodeid] = {
+                "status": "NOT_RUN",
+                "calls": 0,
+                "group": (phase, operator),
+                "target": target,
+                "target_error": target_error,
+            }
 
     @pytest.hookimpl(hookwrapper=True, tryfirst=True)
     def pytest_runtest_protocol(self, item, nextitem):
@@ -270,7 +355,16 @@ class _ReferenceCandidatePlugin:
         state.candidate_derivative_calls = 0
         state.completed_timings = 0
         state.selection_empty = False
-        outcome = yield
+        record = self.records[item.nodeid]
+        with pytest.MonkeyPatch.context() as patch:
+            if self._is_correctness(item):
+                if record["target_error"]:
+                    raise ReferenceContractError(
+                        f"{item.nodeid}: {record['target_error']}"
+                    )
+                if record["target"] is not None:
+                    _patch_test_reference(item, patch, record["target"])
+            outcome = yield
         interrupted = outcome.excinfo and issubclass(
             outcome.excinfo[0],
             (KeyboardInterrupt, SystemExit, pytest.exit.Exception),
@@ -289,15 +383,22 @@ class _ReferenceCandidatePlugin:
             return
         if self._is_correctness(item):
             if state.candidate_calls == 0:
-                if not state.reference_selected:
-                    message = (
-                        f"{item.nodeid}: No predefined reference selected; "
-                        "explicitly pass a callable reference to get_candidate."
-                    )
-                else:
+                if state.reference_selected:
                     message = (
                         f"{item.nodeid}: explicit reference contract did not "
                         "complete a candidate-side call."
+                    )
+                elif callable(
+                    getattr(getattr(item, "module", None), "reference", None)
+                ):
+                    message = (
+                        f"{item.nodeid}: Cannot resolve the public operator for reference. "
+                        "Declare OVERRIDE_KEY with its qualified path."
+                    )
+                else:
+                    message = (
+                        f"{item.nodeid}: No predefined reference selected; "
+                        "define a callable reference in the test module."
                     )
                 outcome.force_exception(ReferenceContractError(message))
             return
@@ -319,20 +420,21 @@ class _ReferenceCandidatePlugin:
         state = getattr(item, "_reference_execution", None)
         if state is None:
             return
-        record = self.records.setdefault(item.nodeid, {"status": "NOT_RUN", "calls": 0})
+        record = self.records[item.nodeid]
         correctness = self._is_correctness(item)
 
         if (
             correctness
             and report.skipped
             and not state.reference_selected
+            and not callable(getattr(getattr(item, "module", None), "reference", None))
             and not state.contract_errors
         ):
             # A skip (including a fixture skip or xfail) must not hide a test
             # that never declared its reference.
             ReferenceContractError(
-                f"{item.nodeid}: No predefined reference selected; explicitly "
-                "pass a callable reference to get_candidate."
+                f"{item.nodeid}: No predefined reference selected. "
+                "Define a callable reference in the test module."
             )
 
         if len(state.contract_errors) > state.reported_contract_errors:
@@ -366,14 +468,31 @@ class _ReferenceCandidatePlugin:
     @pytest.hookimpl(hookwrapper=True, tryfirst=True)
     def pytest_sessionfinish(self, session, exitstatus):
         yield
-        records = list(self.records.values())
-        supported = any(
-            record["status"] == "PASSED" and record["calls"] > 0 for record in records
-        )
+        if session.exitstatus not in (
+            pytest.ExitCode.OK,
+            pytest.ExitCode.NO_TESTS_COLLECTED,
+        ):
+            return
+        records = self.records.values()
+        selected = {
+            record["group"] for record in records if record["status"] != "NOT_SELECTED"
+        }
+        called = {
+            record["group"]
+            for record in records
+            if record["status"] == "PASSED" and record["calls"] > 0
+        }
+        missing = selected - called
         complete = all(
             record["status"] in {"PASSED", "SKIP", "NOT_SELECTED"} for record in records
         )
-        if (
-            self.collection_failed or not supported or not complete
-        ) and session.exitstatus in (0, 5):
+        if missing:
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is not None:
+                for phase, operator in sorted(missing):
+                    reporter.write_line(
+                        "ReferenceContractError: no successful reference candidate "
+                        f"call for {operator} ({phase})."
+                    )
+        if self.collection_failed or not called or missing or not complete:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED

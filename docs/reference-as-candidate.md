@@ -9,35 +9,44 @@ The flag is off by default and changes nothing unless it is passed.
 
 ## Correctness tests
 
-Call the shared helper with an exact public operator path and the reference
-callable the test already trusts:
+Define a callable named `reference` in the test module and call the public
+operator through its module attribute. For example, in
+`tests/megatron/test_fast_gelu.py`:
 
 ```python
-from flag_train.reference_candidate import get_candidate
+import pytest
+import torch
 
-op = get_candidate("flag_train.megatron.fast_gelu", reference=fast_gelu_ref)
-y = op(x)
+import flag_train
+
+
+def reference(x):
+    return torch.nn.functional.gelu(x, approximate="tanh")
+
+
+@pytest.mark.fast_gelu
+def test_fast_gelu():
+    x = torch.arange(8, dtype=torch.float32, device=flag_train.device)
+    torch.testing.assert_close(flag_train.megatron.fast_gelu(x), reference(x))
 ```
 
-Accepted paths are `flag_train.<component>.<name>` and
-`<component>.<name>`, where `<component>` is `megatron`, `deepspeed`, or
-`transformer_engine`. Bare operator names are rejected; there is no second
-name-discovery policy.
+The plugin resolves the operator from the usual component and filename,
+an existing `OP_NAME`, or a uniquely matching operator mark. Use a module-level
+`OVERRIDE_KEY` containing a qualified path such as `megatron.fast_gelu` to
+specify the target explicitly.
 
-* Without the flag, `get_candidate` returns the live public attribute, so CLI
-  overrides installed on `flag_train` are observed.
-* With the flag, the reference is selected before any operator lookup. The
-  candidate export does not need to exist.
-* `reference` must be callable and must match the candidate's signature,
-  inputs, outputs, and mutation contract. Device or module-specific adapters
-  belong in the calling test, not in the helper.
-* A missing or non-callable reference fails the selected test with
-  `ReferenceContractError: ... No predefined reference ...`.
-* A test that does not call `get_candidate` fails in this mode instead of
-  running the ordinary candidate. Reference calls made only by fixtures or by
-  another test case do not count.
+During the test call, the plugin temporarily replaces the public attribute
+with the reference and restores it afterward. Access the operator through the
+module when calling it so the replacement is visible. The explicit reference
+must match the candidate's signature, outputs, and mutation contract.
+A missing reference, ambiguous target, or test that never calls the replaced
+operator fails with `ReferenceContractError`. Calls to the oracle directly and
+calls made by fixtures do not count. Each selected operator needs at least one
+successful candidate-side call. Individual cases for that operator may skip.
 
-Run only the tests that have opted in:
+Existing `get_candidate(..., reference=...)` calls still work and emit
+`DeprecationWarning`. Migrate them by declaring `reference` at module level
+and calling the public operator entry point.
 
 ```sh
 pytest tests -m "<operator>" --ref-as-candidate
