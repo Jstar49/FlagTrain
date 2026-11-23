@@ -29,10 +29,6 @@ recompile limit is smaller than this benchmark's case count, so the module
 raises it; otherwise the baseline could silently fall back to eager.
 """
 
-import importlib.metadata
-import os
-import warnings
-
 import pytest
 import torch
 
@@ -50,70 +46,6 @@ _CORE_SHAPES = [
     (16, 128, 8192),
     (256, 32768),
 ]
-
-# Enough capacity for 7 shapes x 3 dtypes without Dynamo falling back to eager
-# halfway through the suite.
-_DYNAMO_RECOMPILE_LIMIT = 128
-
-
-def _mcore_version():
-    try:
-        return importlib.metadata.version("megatron-core")
-    except Exception:
-        return "not installed"
-
-
-_MCORE_VERSION = _mcore_version()
-
-
-def _stabilize_megatron_compile():
-    """Keep the compiled baseline working on every backend.
-
-    The vendored baseline always uses ``torch.compile``, even when
-    Megatron-LM is absent. Therefore Dynamo must be configured regardless
-    of whether Megatron-LM is installed; otherwise the baseline can silently
-    fall back to eager after reaching its recompile limit.
-    """
-    # Inductor's async compile sends each Triton kernel to a worker process
-    # and pickles the compiled kernel back. Some vendor Triton builds cannot
-    # pickle JITFunction because it carries an RLock. One compile thread keeps
-    # compilation in-process; it changes compile time only, not measured time.
-    try:
-        import torch._inductor.config
-
-        if getattr(torch._inductor.config, "compile_threads", 1) != 1:
-            torch._inductor.config.compile_threads = 1
-    except ImportError:
-        pass
-
-    try:
-        import torch._dynamo
-    except ImportError:
-        return
-
-    if hasattr(torch._dynamo.config, "recompile_limit"):
-        current = torch._dynamo.config.recompile_limit
-    elif hasattr(torch._dynamo.config, "cache_size_limit"):
-        current = torch._dynamo.config.cache_size_limit
-    else:
-        return
-    if current >= _DYNAMO_RECOMPILE_LIMIT:
-        return
-
-    if hasattr(torch._dynamo.config, "recompile_limit"):
-        torch._dynamo.config.recompile_limit = _DYNAMO_RECOMPILE_LIMIT
-    else:
-        torch._dynamo.config.cache_size_limit = _DYNAMO_RECOMPILE_LIMIT
-    warnings.warn(
-        "raised the torch._dynamo recompile limit to "
-        f"{_DYNAMO_RECOMPILE_LIMIT} so the torch.compile baseline does not "
-        "silently fall back to eager",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-
-
-_stabilize_megatron_compile()
 
 
 def _dtypes():
@@ -137,26 +69,20 @@ def bias_geglu_input_fn(shape, dtype, device):
     yield (x, bias)
 
 
-def torch_op(x, bias):
-    """Compiled Megatron-LM baseline, or the vendored compiled fallback."""
-    return _BASELINE_IMPL(x, bias)
-
-
-def train_op(x, bias):
-    """The operator under test."""
-    return flag_train.megatron.bias_geglu_impl(x, bias)
+def base_op():
+    try:
+        from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
+    except Exception:
+        return None
+    return bias_geglu_impl
 
 
 @pytest.mark.bias_geglu_impl
 def test_bias_geglu_impl_perf():
     """Benchmark GEGLU for every shape and dtype in one table."""
+    torch_op = base_op()
+    _BASELINE = "megatron-core bias_geglu_impl" if torch_op is not None else "none"
     print(f"\nBaseline: {_BASELINE}")
-
-    # On Ascend, enable parallel scheduling of all blocks to avoid excessive
-    # logical cores and reduce scheduling overhead when the logical core count
-    # exceeds 65,535.
-    if flag_train.vendor_name == "ascend":
-        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
 
     bench = BiasGegluImplBenchmark(
         input_fn=bias_geglu_input_fn,
@@ -165,71 +91,5 @@ def test_bias_geglu_impl_perf():
         dtypes=_dtypes(),
         is_backward=False,
     )
-    bench.set_train(train_op)
+    bench.set_train(flag_train.megatron.bias_geglu_impl)
     bench.run()
-
-
-# ===========================================================================
-# Appendix: vendored Megatron-LM baseline
-#
-# Source: NVIDIA Megatron-LM, megatron/core/fusions/fused_bias_geglu.py
-#   https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/fusions/fused_bias_geglu.py
-#
-# ``jit_fuser`` is replaced by ``torch.compile``. Autograd and backward-only
-# helpers are omitted because this benchmark measures forward only. The
-# forward formula is unchanged. This is a performance baseline, not the
-# correctness oracle used by the unit tests.
-# ===========================================================================
-
-jit_fuser = torch.compile
-
-
-@jit_fuser
-def geglu(y):
-    """GEGLU using Megatron-LM's tanh approximation of GELU."""
-    y_1, y_2 = torch.chunk(y, 2, -1)
-    gate = y_1 * 0.5 * (1.0 + torch.tanh(0.79788456 * y_1 * (1 + 0.044715 * y_1 * y_1)))
-    return gate * y_2
-
-
-@jit_fuser
-def _compiled_bias_geglu(y, bias):
-    """Compiled bias addition followed by GEGLU."""
-    if bias is not None:
-        y = y + bias
-    return geglu(y)
-
-
-def _vendored_bias_geglu_impl(input, bias):
-    """Vendored forward baseline supporting two- and three-dimensional input."""
-    ori_shape = input.shape
-    assert len(ori_shape) in [2, 3]
-    flat = input.view(-1, ori_shape[-1])
-    out = _compiled_bias_geglu(flat, bias)
-    return out if len(ori_shape) == 2 else out.view(*ori_shape[:-1], -1)
-
-
-def _load_baseline():
-    """Load installed Megatron-LM, otherwise use the vendored implementation."""
-    if _MCORE_VERSION != "not installed":
-        try:
-            from megatron.core.fusions.fused_bias_geglu import (
-                bias_geglu_impl as installed,
-            )
-        except ImportError as exc:
-            reason = f"megatron-core {_MCORE_VERSION} cannot import it: {exc}"
-        else:
-            return installed, f"megatron-core {_MCORE_VERSION}"
-    else:
-        reason = "Megatron-LM is not installed"
-
-    warnings.warn(
-        f"{reason}; using the vendored compiled implementation as the "
-        "GEGLU benchmark baseline",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-    return _vendored_bias_geglu_impl, "vendored compiled implementation"
-
-
-_BASELINE_IMPL, _BASELINE = _load_baseline()

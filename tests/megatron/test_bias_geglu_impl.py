@@ -221,7 +221,7 @@ def test_bias_geglu_impl_noncontiguous(dtype):
     transposed = cube.transpose(0, 2)
 
     # The public view rejects this layout before operand validation.
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         flag_train.megatron.bias_geglu_impl(transposed, None)
 
 

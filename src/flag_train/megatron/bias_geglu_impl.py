@@ -78,8 +78,6 @@ def _validate_inputs(flat, bias):
     )
     if not supported_dtype:
         raise ValueError("bias_geglu input has an unsupported dtype")
-    if not flat.is_contiguous():
-        raise ValueError("bias_geglu input must be contiguous")
     if flat.shape[-1] % 2 != 0:
         raise ValueError("bias_geglu input's last dimension must be even")
 
@@ -198,6 +196,12 @@ def bias_geglu_impl(input, bias):
     input. All activation arithmetic runs in the Triton kernel.
     """
     logger.debug("TRAIN BIAS_GEGLU_IMPL")
+    # Judge contiguity on the caller's tensor, before ``view`` can touch it:
+    # some runtimes monkeypatch ``torch.Tensor.view`` to copy non-contiguous
+    # tensors first (Megatron-LM-FL does this on NPU), which would make the
+    # flattened view contiguous and hide the layout from ``_validate_inputs``.
+    if not input.is_contiguous():
+        raise ValueError("bias_geglu input must be contiguous")
     flat, ori_shape = _flatten_input(input)
 
     _validate_inputs(flat, bias)
