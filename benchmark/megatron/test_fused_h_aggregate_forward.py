@@ -158,11 +158,11 @@ class FusedHAggregateForwardBenchmark(base.GenericBenchmark):
         """Boundary traffic of one call: read ``x`` and ``h_pre``, write ``out``."""
         x, h_pre = args[0], args[1]
         s, b, n, C = x.shape
-        out_dtype = torch.promote_types(x.dtype, h_pre.dtype)
+        # The aggregate is cast back to x.dtype, matching Megatron main.
         element = x.element_size()
         io_bytes = x.numel() * element
         io_bytes += h_pre.numel() * h_pre.element_size()
-        io_bytes += s * b * C * out_dtype.itemsize
+        io_bytes += s * b * C * element
         return io_bytes * 1e-9 / (latency * 1e-3)
 
     def get_tflops(self, op, *args, **kwargs):

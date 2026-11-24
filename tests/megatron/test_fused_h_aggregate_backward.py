@@ -166,24 +166,22 @@ _TOL_GRAD_H = {
 
 
 def _assert_close(res, ref, dtype, tol):
-    """Compare at ``tol`` of the reference's RMS, elementwise.
+    """Compare with the repo ``train_assert_close`` at ``tol`` of the reference's RMS.
 
-    A per-element ``rtol`` is the wrong shape of tolerance for a reduction:
-    scaling by the reference's RMS holds every element to the same budget, which
-    is the elementwise form of the relative Frobenius error.
+    The RMS-scaled ``atol`` holds every element to the same budget, which is the
+    elementwise form of the relative Frobenius error; the helper adds its
+    standard per-dtype ``rtol`` on top.
     """
     assert res.dtype == dtype, (res.dtype, dtype)
     assert res.shape == ref.shape, (res.shape, ref.shape)
 
-    res = utils.to_reference(res).float()
-    ref = utils.to_reference(ref).float()
+    res = utils.to_reference(res)
+    ref = utils.to_reference(ref)
     if res.numel() == 0:
         return
     finite = torch.isfinite(ref)
-    scale = ref[finite].pow(2).mean().sqrt().item() if finite.any() else 0.0
-    torch.testing.assert_close(
-        res, ref, atol=tol * scale, rtol=tol, equal_nan=True, check_dtype=False
-    )
+    scale = ref[finite].float().pow(2).mean().sqrt().item() if finite.any() else 0.0
+    utils.train_assert_close(res, ref, dtype, equal_nan=True, atol=tol * scale)
 
 
 def _oracle_backward(grad_output, x, h_pre):
@@ -271,7 +269,9 @@ def test_fused_h_aggregate_backward_mixed_dtype(dtype, h_dtype):
         grad_output, x.to(promoted), h_pre.to(promoted)
     )
     assert grad_x.dtype == dtype and grad_h.dtype == h_dtype
-    assert torch.equal(grad_x, grad_x_p.to(dtype))
+    utils.train_assert_equal(
+        utils.to_reference(grad_x), utils.to_reference(grad_x_p.to(dtype))
+    )
     _assert_close(grad_h, grad_h_p, h_dtype, _TOL_GRAD_H[h_dtype])
 
 
@@ -292,8 +292,8 @@ def test_fused_h_aggregate_backward_non_contiguous(dtype):
     grad_x_c, grad_h_c = flag_train.megatron.fused_h_aggregate_backward(
         grad_output.contiguous(), x.contiguous(), h_pre.contiguous()
     )
-    assert torch.equal(grad_x, grad_x_c)
-    assert torch.equal(grad_h, grad_h_c)
+    utils.train_assert_equal(utils.to_reference(grad_x), utils.to_reference(grad_x_c))
+    utils.train_assert_equal(utils.to_reference(grad_h), utils.to_reference(grad_h_c))
 
 
 @pytest.mark.fused_h_aggregate_backward
@@ -326,7 +326,7 @@ def test_fused_h_aggregate_backward_contract(dtype):
     assert grad_h.shape == (129, 7, 4) and grad_h.dtype == dtype
     assert grad_x.is_contiguous() and grad_h.is_contiguous()
     for tensor, copy in zip((grad_output, x, h_pre), copies):
-        assert torch.equal(tensor, copy)
+        utils.train_assert_equal(utils.to_reference(tensor), utils.to_reference(copy))
 
 
 @pytest.mark.fused_h_aggregate_backward

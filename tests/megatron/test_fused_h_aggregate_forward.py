@@ -17,10 +17,12 @@ The oracle is Megatron-LM's ``native_h_aggregate`` -- the function this operator
 ports -- from the installed megatron-core when it provides the function, and otherwise
 from ``native_h_aggregate_ref``, the same code transcribed below.
 Megatron wraps it in ``@torch.compile``; the eager body is what is compared
-against. The kernel accumulates in fp32 and rounds once, while the reference
-rounds each of the ``n`` products into the input dtype first, so at the narrow
-dtypes the reference is the less accurate side and the tolerances below cover
-its rounding.
+against. Current Megatron main computes mixed operands in the promoted dtype and
+casts the result back to ``x.dtype``; the installed snapshot in some images
+predates that cast, so the comparison applies it explicitly. The kernel
+accumulates in fp32 and rounds once, while the reference rounds each of the
+``n`` products into the input dtype first, so at the narrow dtypes the reference
+is the less accurate side and the tolerances below cover its rounding.
 """
 
 import importlib.metadata
@@ -109,8 +111,8 @@ if utils.bf16_is_supported:
 
 
 def native_h_aggregate_ref(x, h_pre):
-    """Megatron-LM's ``native_h_aggregate`` (``hyper_connection.py``, 0.20)."""
-    return (x * h_pre.unsqueeze(-1)).sum(dim=2)
+    """Megatron-LM's ``native_h_aggregate`` with the current output cast."""
+    return (x * h_pre.unsqueeze(-1)).sum(dim=2).to(x.dtype)
 
 
 def _mcore_version():
@@ -151,24 +153,22 @@ _TOL = {
 
 
 def _assert_close(res, ref, dtype, tol):
-    """Compare at ``tol`` of the reference's RMS, elementwise.
+    """Compare with the repo ``train_assert_close`` at ``tol`` of the reference's RMS.
 
-    A per-element ``rtol`` is the wrong shape of tolerance for a sum of ``n``
-    products: scaling by the reference's RMS holds every element to the same
-    budget, which is the elementwise form of the relative Frobenius error.
+    The RMS-scaled ``atol`` holds every element to the same budget, which is the
+    elementwise form of the relative Frobenius error; the helper adds its
+    standard per-dtype ``rtol`` on top.
     """
     assert res.dtype == dtype, (res.dtype, dtype)
     assert res.shape == ref.shape, (res.shape, ref.shape)
 
-    res = utils.to_reference(res).float()
-    ref = utils.to_reference(ref).float()
+    res = utils.to_reference(res)
+    ref = utils.to_reference(ref)
     if res.numel() == 0:
         return
     finite = torch.isfinite(ref)
-    scale = ref[finite].pow(2).mean().sqrt().item() if finite.any() else 0.0
-    torch.testing.assert_close(
-        res, ref, atol=tol * scale, rtol=tol, equal_nan=True, check_dtype=False
-    )
+    scale = ref[finite].float().pow(2).mean().sqrt().item() if finite.any() else 0.0
+    utils.train_assert_close(res, ref, dtype, equal_nan=True, atol=tol * scale)
 
 
 def _operands(shape, dtype, h_dtype=None):
@@ -183,6 +183,10 @@ def _check(x, h_pre, dtype):
     """Run the operator against the oracle and return its output."""
     out = flag_train.megatron.fused_h_aggregate_forward(x, h_pre)
     ref = _native_h_aggregate(utils.to_reference(x), utils.to_reference(h_pre))
+    # Megatron main casts the aggregate back to x.dtype. The installed
+    # megatron-core in some images predates that cast; apply it here so the
+    # comparison is against the current upstream semantics, not the snapshot.
+    ref = ref.to(dtype)
     _assert_close(out, ref, dtype, _TOL[dtype])
     return out
 
@@ -214,23 +218,26 @@ def test_fused_h_aggregate_forward_benchmark_shapes(shape, dtype):
 @pytest.mark.fused_h_aggregate_forward
 @pytest.mark.parametrize("dtype, h_dtype", _MIXED_DTYPES)
 def test_fused_h_aggregate_forward_mixed_dtype(dtype, h_dtype):
-    """Mixed inputs promote, and the promotion is the kernel's.
+    """Mixed inputs compute in the promoted dtype and return ``x.dtype``.
 
-    The oracle covers the arithmetic; what is checked in addition is that the
-    mixed call is bit-identical to the call with both operands already promoted,
-    which a host-side copy would not be.
+    Megatron main casts the aggregate back to the activation dtype; the oracle
+    covers the arithmetic. What is checked in addition is that the mixed call is
+    bit-identical to the call with both operands already promoted after the same
+    output cast, which a host-side promotion would not be.
     """
     shape = (2, 4, 4, 1024) if utils.QUICK_MODE else (32, 32, 4, 4096)
     promoted = torch.promote_types(dtype, h_dtype)
     x, h_pre = _operands(shape, dtype, h_dtype)
 
-    out = _check(x, h_pre, promoted)
+    out = _check(x, h_pre, dtype)
 
     out_ref = flag_train.megatron.fused_h_aggregate_forward(
         x.to(promoted), h_pre.to(promoted)
     )
-    assert out.dtype == promoted
-    assert torch.equal(out, out_ref)
+    assert out.dtype == dtype
+    utils.train_assert_equal(
+        utils.to_reference(out), utils.to_reference(out_ref.to(dtype))
+    )
 
 
 @pytest.mark.fused_h_aggregate_forward
@@ -249,7 +256,7 @@ def test_fused_h_aggregate_forward_non_contiguous(dtype):
     out_c = flag_train.megatron.fused_h_aggregate_forward(
         x.contiguous(), h_pre.contiguous()
     )
-    assert torch.equal(out, out_c)
+    utils.train_assert_equal(utils.to_reference(out), utils.to_reference(out_c))
 
 
 @pytest.mark.fused_h_aggregate_forward
@@ -277,7 +284,8 @@ def test_fused_h_aggregate_forward_contract(dtype):
 
     assert out.shape == (129, 7, 300) and out.dtype == dtype
     assert out.is_contiguous()
-    assert torch.equal(x, x_copy) and torch.equal(h_pre, h_pre_copy)
+    utils.train_assert_equal(utils.to_reference(x), utils.to_reference(x_copy))
+    utils.train_assert_equal(utils.to_reference(h_pre), utils.to_reference(h_pre_copy))
 
 
 @pytest.mark.fused_h_aggregate_forward

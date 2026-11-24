@@ -38,12 +38,12 @@ needs a tile of its own. Tiling it would instead put ``n`` in the innermost
 loop, where the same rows of the next stream land ``C`` elements apart.
 
 ``x`` and ``h_pre`` may have different floating dtypes -- the mHC mapping
-parameters are held in fp32 while the activations are bf16/fp16 -- in which case
-both are promoted for the computation and the output carries
-``torch.promote_types(x.dtype, h_pre.dtype)``. That is what Megatron's reference
-produces (the Python multiply broadcasts and promotes), and the promotion is
-done inside the kernel: promoting ``x`` on the host would copy every element of
-the largest operand for no arithmetic benefit.
+parameters are held in fp32 while the activations are bf16/fp16. Both are
+promoted for the computation, and the result is cast back to ``x.dtype``, which
+is what Megatron's ``native_h_aggregate`` and ``FusedHAggregate`` return. The
+promotion and the output cast happen inside the kernel: promoting ``x`` on the
+host would copy every element of the largest operand for no arithmetic benefit,
+and the cast is the precision barrier Megatron applies at the aggregate output.
 
 Every element of the output is an independent short reduction, so the operator
 is bound by how fast ``x`` streams in, not by arithmetic.
@@ -172,11 +172,11 @@ def fused_h_aggregate_forward(
         x (Tensor): ``[s, b, n, C]`` fp16, bf16 or fp32 stream activations on
             the active device. A non-contiguous input is copied.
         h_pre (Tensor): ``[s, b, n]`` per-token stream weights. Its dtype may
-            differ from ``x``'s; both are promoted to
-            ``torch.promote_types(x.dtype, h_pre.dtype)``.
+            differ from ``x``'s; both are promoted for the computation and the
+            result is cast back to ``x``'s dtype.
 
     Returns:
-        Tensor: ``[s, b, C]`` in the promoted input dtype.
+        Tensor: ``[s, b, C]`` in ``x``'s dtype.
     """
     logger.debug("TRAIN FUSED_H_AGGREGATE_FORWARD")
     _check_input(x, "x", 4)
@@ -188,8 +188,9 @@ def fused_h_aggregate_forward(
         )
 
     s, b, n, C = x.shape
-    out_dtype = torch.promote_types(x.dtype, h_pre.dtype)
-    out = x.new_empty((s, b, C), dtype=out_dtype)
+    # Megatron casts the aggregate back to the activation dtype; keep that
+    # precision barrier instead of leaking a promoted dtype into the layer.
+    out = x.new_empty((s, b, C))
     if s == 0 or b == 0 or C == 0:
         return out
     if n == 0:
