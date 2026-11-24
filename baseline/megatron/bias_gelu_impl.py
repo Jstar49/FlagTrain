@@ -20,14 +20,16 @@ Self-contained module; depends only on torch and megatron, and does not import
 (``GeLUFunction.apply``) and raises when Megatron is unavailable instead of
 falling back to a torch composition.
 
-FlagTrain does not benchmark ``bias_gelu_impl`` yet. The shapes and dtypes are
-the fused-MLP activation cases of
-``FlagTrain/benchmark/megatron/test_bias_geglu_impl.py`` (``_CORE_SHAPES`` and
-``_dtypes``); ``bias_gelu_impl`` is the non-gated sibling measured there, so the
-same token counts and hidden widths keep the two baselines comparable. The
-input is ``[tokens, hidden]`` and the bias is one ``[hidden]`` vector broadcast
-across rows, matching Megatron's own use (``bias_gelu_impl(x, bias)`` in
-``transformer/mlp.py`` and ``training/kernel_warmup.py``).
+The shapes and dtypes are ``FlagTrain/benchmark/megatron/test_bias_gelu_impl.py``
+(``_CORE_SHAPES`` and ``_dtypes``); ``bias_gelu_impl`` is the non-gated sibling
+of the fused-MLP benchmark, so the same token counts and hidden widths keep the
+two baselines comparable. The input is ``[tokens, hidden]``. The bias is one
+``[hidden]`` vector broadcast across rows by default -- matching Megatron's own
+use (``bias_gelu_impl(x, bias)`` in ``transformer/mlp.py`` and
+``training/kernel_warmup.py``) -- and, at the shapes in ``_FULL_BIAS_SHAPES``,
+a full ``[tokens, hidden]`` tensor: the kernel's elementwise path, which reads
+a bias as large as the input. The two are separate bindings with distinct
+``key_shape`` values so their baseline records cannot collide.
 
 Megatron decorates the helper behind ``bias_gelu_impl`` with ``@jit_fuser``,
 which is ``torch.compile`` on supported PyTorch versions. This module disables
@@ -46,7 +48,7 @@ OP_NAME = "bias_gelu_impl"
 DTYPES = [torch.float16, torch.float32, torch.bfloat16]
 IS_INPLACE = False
 
-# benchmark/megatron/test_bias_geglu_impl.py::_CORE_SHAPES
+# benchmark/megatron/test_bias_gelu_impl.py::_CORE_SHAPES
 # (tokens, hidden); the activation keeps the full width (no gate/linear split).
 _SHAPES = [
     (64, 64),
@@ -57,6 +59,14 @@ _SHAPES = [
     (16, 128, 8192),
     (256, 32768),
 ]
+
+# benchmark/megatron/test_bias_gelu_impl.py::_FULL_BIAS_SHAPES
+_FULL_BIAS_SHAPES = {
+    (4096, 4096),
+    (16, 128, 8192),
+    (2048, 11008),
+    (256, 32768),
+}
 
 _NATIVE = None
 
@@ -97,29 +107,40 @@ def native():
 
 
 def grid():
-    return [{"shape": shape} for shape in _SHAPES]
+    bindings = [{"shape": shape, "bias_mode": "vector"} for shape in _SHAPES]
+    bindings += [
+        {"shape": shape, "bias_mode": "full"}
+        for shape in _SHAPES
+        if tuple(shape) in _FULL_BIAS_SHAPES
+    ]
+    return bindings
 
 
 def build_inputs(binding, dtype, device):
-    hidden = binding["shape"][-1]
-    input = torch.randn(binding["shape"], dtype=dtype, device=device)
-    bias = torch.randn((hidden,), dtype=dtype, device=device)
+    shape = binding["shape"]
+    input = torch.randn(shape, dtype=dtype, device=device)
+    if binding["bias_mode"] == "full":
+        bias = torch.randn(shape, dtype=dtype, device=device)
+    else:
+        bias = torch.randn((shape[-1],), dtype=dtype, device=device)
     return (input, bias), {}
 
 
 def key_shape(binding):
-    # First tensor: the [tokens, hidden] input; unique per deployment.
-    return list(binding["shape"])
+    # Both bias modes share the input's shape, so the key names the mode too:
+    # a vector bias and a full bias of one shape are different measurements.
+    dims = "x".join(str(dim) for dim in binding["shape"])
+    return f"{dims}_{binding['bias_mode']}_bias"
 
 
 def config(binding, dtype):
     shape = list(binding["shape"])
     hidden = shape[-1]
+    bias_shape = shape if binding["bias_mode"] == "full" else [hidden]
     return {
         "inputs": {
             "input": {"shape": shape, "dtype": str(dtype)},
-            # One [hidden] bias vector is broadcast across all rows.
-            "bias": {"shape": [hidden], "dtype": str(dtype)},
+            "bias": {"shape": bias_shape, "dtype": str(dtype)},
         },
         "outputs": {
             "out": {"shape": shape, "dtype": str(dtype)},
@@ -128,5 +149,6 @@ def config(binding, dtype):
             "num_tokens": math.prod(shape[:-1]),
             "hidden": hidden,
             "shape": shape,
+            "bias_mode": binding["bias_mode"],
         },
     }

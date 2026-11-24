@@ -19,6 +19,7 @@ the generic one it replaces. Define it here, re-export it, and list it in
 same-named generic implementation.
 """
 
+from .bias_gelu_impl import bias_gelu_impl
 from .bias_swiglu_impl import bias_swiglu_impl
 from .fast_gelu import fast_gelu
 from .fused_gated_norm import fused_gated_norm
@@ -43,6 +44,7 @@ from .weighted_squared_relu_impl import weighted_squared_relu_impl
 from .weighted_swiglu_funciton import weighted_swiglu_funciton
 
 __all__ = [
+    "bias_gelu_impl",
     "bias_swiglu_impl",
     "fast_gelu",
     "fused_gated_norm",

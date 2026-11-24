@@ -29,8 +29,10 @@ ops:
   stages:
   - beta: '0.0.0'
 - id: bias_gelu_impl
-  description: 'Fused bias addition and tanh-approximate GELU. Forward only; bias
-    addition rounds to the input dtype before FP32 activation arithmetic.'
+  description: 'Fused bias addition and tanh-approximate GELU. Forward only; follows
+    Megatron dtype promotion including Python scalar operands, integer/bool sums
+    return FP32, CPU inputs are staged through the accelerator, and complex inputs
+    are not supported.'
   for:
   - bias_gelu_impl
   labels:

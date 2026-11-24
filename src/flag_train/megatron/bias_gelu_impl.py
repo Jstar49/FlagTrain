@@ -13,12 +13,17 @@
 # limitations under the License.
 """Forward-only bias + tanh GELU using the common Triton/FlagTree backend.
 
-Bias addition rounds to the operand dtype before FP32 activation arithmetic.
-The output is a plain tensor: this operator does not propagate gradients.
+Dtype promotion and output dtypes follow Megatron's torch expression; integer
+and bool sums become FP32, while complex inputs are not supported. The output
+is a plain tensor: this operator does not propagate gradients.
+
+This module is the portable implementation. Ascend replaces the launch with a
+persistent, core-count-bounded grid and gives ``_bias_gelu_tile`` its libdevice
+tanh; see ``runtime/backend/_ascend/megatron/bias_gelu_impl.py``.
 """
 
 import logging
-from contextlib import nullcontext
+import numbers
 
 import torch
 import triton
@@ -31,15 +36,108 @@ from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_FLOAT_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+)
+_INTEGRAL_DTYPES = (
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.bool,
+)
+# uint16/32/64 are accepted as operands only when promotion moves the sum to a
+# supported dtype. torch.promote_types rejects mixed unsigned pairs, and eager
+# torch add does not implement them either.
+_OPERAND_DTYPES = (
+    _FLOAT_DTYPES + _INTEGRAL_DTYPES + (torch.uint16, torch.uint32, torch.uint64)
+)
+_SUM_DTYPES = _FLOAT_DTYPES + (
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.bool,
+)
 _BLOCK_SIZE = 256
 _NUM_WARPS = 4
-_IS_ASCEND = runtime_device.vendor_name == "ascend"
-_GPU_PATH = tl.constexpr(not _IS_ASCEND)
 # Only this instruction capability differs; GPU scheduling and tiling are shared.
 _HAS_NATIVE_TANH = tl.constexpr(runtime_device.vendor_name == "nvidia")
-if _IS_ASCEND:
-    from flag_train.runtime.backend._ascend.utils import CORE_NUM
+
+
+def _accelerator_device():
+    name = runtime_device.name
+    if name == "cpu":
+        raise RuntimeError(
+            "bias_gelu_impl cannot run CPU inputs without an accelerator: "
+            "no device Triton backend is available"
+        )
+    is_available = getattr(torch_device_fn, "is_available", None)
+    if callable(is_available) and not is_available():
+        raise RuntimeError(
+            f"bias_gelu_impl cannot run CPU inputs: {name} is unavailable"
+        )
+    return name
+
+
+def _resolve_dtypes(input, bias):
+    """Megatron's torch promotion plus the output dtype of the tanh GELU."""
+    if input.dtype not in _OPERAND_DTYPES:
+        raise ValueError(f"unsupported input dtype {input.dtype}")
+    if bias.dtype not in _OPERAND_DTYPES:
+        raise ValueError(f"unsupported bias dtype {bias.dtype}")
+
+    try:
+        sum_dtype = torch.promote_types(input.dtype, bias.dtype)
+    except RuntimeError as exc:
+        raise ValueError(
+            "input and bias promote to an unsupported dtype "
+            f"({input.dtype}, {bias.dtype})"
+        ) from exc
+    if sum_dtype not in _SUM_DTYPES:
+        raise ValueError(f"input and bias promote to an unsupported dtype {sum_dtype}")
+
+    if sum_dtype in _INTEGRAL_DTYPES or sum_dtype == torch.uint8:
+        # Python float constants in the GELU expression promote integer/bool
+        # tensors to the default float dtype.
+        output_dtype = torch.float32
+    else:
+        output_dtype = sum_dtype
+    return sum_dtype, output_dtype
+
+
+def _check_devices(input, bias):
+    """Apply torch's 0-dim CPU scalar rule and return the result device."""
+    if input.device == bias.device:
+        return input, bias, input.device
+    if input.dim() == 0 and input.device.type == "cpu":
+        return input.to(bias.device), bias, bias.device
+    if bias.dim() == 0 and bias.device.type == "cpu":
+        return input, bias.to(input.device), input.device
+    raise ValueError("input and bias must be on the same device")
+
+
+def _as_scalar_tensor(value, tensor, name):
+    """Convert a Python number using the tensor's weak scalar promotion."""
+    try:
+        dtype = torch.result_type(tensor, value)
+    except (RuntimeError, TypeError) as exc:
+        raise ValueError(
+            f"{name} scalar does not promote with dtype {tensor.dtype}"
+        ) from exc
+    try:
+        return torch.as_tensor(value, dtype=dtype, device=tensor.device)
+    except (RuntimeError, OverflowError, TypeError):
+        # torch's integer scalar add wraps an out-of-range Python integer in
+        # the tensor dtype instead of rejecting or promoting it.
+        if dtype in _INTEGRAL_DTYPES:
+            return torch.tensor(value, device=tensor.device).to(dtype)
+        raise
 
 
 @triton.jit
@@ -70,6 +168,10 @@ def _bias_gelu_tile(
     tile,
     ROWWISE: tl.constexpr,
     EVEN: tl.constexpr,
+    INTEGRAL: tl.constexpr,
+    BOOL_SUM: tl.constexpr,
+    FP64: tl.constexpr,
+    SHIM_TANH: tl.constexpr,
 ):
     if (ROWWISE and BIAS_MODE == 1) and not (H <= BLOCK and H & (H - 1) == 0):
         # Explicitly contiguous bias columns avoid Ascend's scalar gather
@@ -95,31 +197,47 @@ def _bias_gelu_tile(
             b = tl.load(B + offsets % H, mask, other=0)
     else:
         b = tl.load(B + offsets, mask, other=0)
-    if not ROWWISE or X.dtype.element_ty != tl.float16:
-        # Only FP16 native addition preserves the tested rounding contract.
-        # Ascend BF16 legalization can retain an unrounded FP32 intermediate;
-        # keep its explicit FP32 -> BF16 -> FP32 rounding barrier.
-        # The established non-Ascend path, including tiny rows, is unchanged.
-        x = x.to(tl.float32)
-        b = b.to(tl.float32)
-    # Match the standalone dtype-rounded add, rather than fusing an FP32 add.
-    z = (x + b).to(X.dtype.element_ty).to(tl.float32)
-    if ROWWISE and X.dtype.element_ty != tl.float32:
-        # Same cubic, factored to remove one FP32 vector multiplication.
-        argument = (0.79788456 + (0.79788456 * 0.044715) * z * z) * z
+    if BOOL_SUM:
+        # torch bool addition is logical OR; the kernel stores 0/1 as uint8.
+        z = x | b
+        zf = z.to(tl.float32)
+    elif INTEGRAL:
+        # Ascend lowers sub-word adds at 32 bits -- an int8/int16 sum does not
+        # wrap the way torch's add does -- and converts a uint8 arithmetic
+        # result to float by sign. Wrap at the operand width and widen through
+        # int32 before the float conversion; on vendors that already wrap both
+        # casts are identities.
+        z = (x + b).to(X.dtype.element_ty)
+        if X.dtype.element_ty == tl.int64:
+            zf = z.to(tl.float32)
+        else:
+            zf = z.to(tl.int32).to(tl.float32)
+    elif FP64:
+        z = x + b
+        zf = z
     else:
-        argument = 0.79788456 * z * (1.0 + 0.044715 * z * z)
+        # Round the bias add to the operand dtype before FP32 activation.
+        # Ascend BF16 legalization can otherwise retain an unrounded FP32
+        # intermediate; FP16 rows keep their native-add path.
+        if not ROWWISE or X.dtype.element_ty != tl.float16:
+            x = x.to(tl.float32)
+            b = b.to(tl.float32)
+        z = (x + b).to(X.dtype.element_ty).to(tl.float32)
+        zf = z
+
+    # Megatron's expression evaluates ``0.044715 * z`` before ``* z``, and
+    # that Python float promotes integer/bool sums to FP32 before the square.
+    # Keep the grouping: squaring in the integer dtype would wrap above the
+    # dtype's square root.
+    argument = 0.79788456 * zf * (1.0 + 0.044715 * zf * zf)
     if ROWWISE:
-        # 0.5*z*(1+tanh(u)) == z/(1+exp(-2*u)). Fuse the activation
-        # epilogue, retaining the FP32 calculation and the dtype rounding above.
-        # Multiply by the reciprocal to preserve the original tiny-value path.
-        result = z * (1.0 / (1.0 + tl.exp(-2.0 * argument)))
-    elif _GPU_PATH:
-        result = _gpu_gelu(z, argument, _HAS_NATIVE_TANH)
-    else:
-        # Ascend small rows retain their original non-rowwise tanh path.
+        # 0.5*z*(1+tanh(u)) == z/(1+exp(-2*u)).
+        result = zf * (1.0 / (1.0 + tl.exp(-2.0 * argument)))
+    elif FP64 or SHIM_TANH:
         t = tl_extra_shim.tanh(argument)
-        result = 0.5 * z * (1.0 + t)
+        result = 0.5 * zf * (1.0 + t)
+    else:
+        result = _gpu_gelu(zf, argument, _HAS_NATIVE_TANH)
     tl.store(Y + offsets, result, mask)
 
 
@@ -133,44 +251,67 @@ def _bias_gelu_forward_kernel(
     H: tl.constexpr,
     BIAS_MODE: tl.constexpr,
     BLOCK: tl.constexpr,
-    PERSISTENT: tl.constexpr = False,
     EVEN: tl.constexpr = False,
+    INTEGRAL: tl.constexpr = False,
+    BOOL_SUM: tl.constexpr = False,
+    FP64: tl.constexpr = False,
 ):
-    if PERSISTENT:
-        # Bound physical programs to vector cores; stride over arbitrarily many
-        # logical tiles. The runtime trip count avoids compile-time unrolling.
-        if (BIAS_MODE == 1 and H >= 128) and not (H <= BLOCK and H & (H - 1) == 0):
-            tiles = (N // H) * tl.cdiv(H, BLOCK)
-        else:
-            tiles = tl.cdiv(N, BLOCK)
-        for tile in range(tle.program_id(0), tiles, tl.num_programs(0)):
-            _bias_gelu_tile(X, B, Y, N, H, BIAS_MODE, BLOCK, tile, H >= 128, EVEN)
-    else:
-        _bias_gelu_tile(X, B, Y, N, H, BIAS_MODE, BLOCK, tle.program_id(0), False, EVEN)
+    _bias_gelu_tile(
+        X,
+        B,
+        Y,
+        N,
+        H,
+        BIAS_MODE,
+        BLOCK,
+        tle.program_id(0),
+        False,
+        EVEN,
+        INTEGRAL,
+        BOOL_SUM,
+        FP64,
+        False,
+    )
 
 
 def bias_gelu_impl(input, bias):
     """Return tanh GELU(input + bias), without gradient propagation.
 
-    Operands must share the active accelerator and an FP16/BF16/FP32 dtype.
-    PyTorch broadcasting, noncontiguous inputs and empty tensors are supported.
-    The result is contiguous, with the broadcast shape and operand dtype.
-    Invalid types raise TypeError; invalid dtype, device or shapes raise ValueError.
+    The forward semantics and dtype promotion are Megatron's: operands are
+    broadcast, added in their promoted dtype, and the GELU runs in that dtype;
+    integer/bool sums produce FP32. One operand may be a Python number: it
+    follows torch's weak scalar promotion, as Megatron's expression does.
+    Complex inputs are rejected. CPU inputs are staged through the accelerator
+    and the result is copied back. Invalid types raise TypeError; unsupported
+    dtypes, devices or shapes raise ValueError.
     """
     logger.debug("TRAIN BIAS_GELU_IMPL")
-    metadata = []
-    for name, tensor in (("input", input), ("bias", bias)):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a tensor")
-        dtype, device = tensor.dtype, tensor.device
-        if dtype not in _DTYPES:
-            raise ValueError(f"{name} must have FP16, BF16 or FP32 dtype")
-        if device.type != runtime_device.name or device.type == "cpu":
-            raise ValueError(f"{name} must be on the active accelerator")
-        metadata.append((dtype, device))
-    (input_dtype, input_device), (bias_dtype, bias_device) = metadata
-    if input_dtype != bias_dtype or input_device != bias_device:
-        raise ValueError("input and bias must have the same dtype and device")
+    for name, value in (("input", input), ("bias", bias)):
+        if isinstance(value, torch.Tensor):
+            if value.dtype not in _OPERAND_DTYPES:
+                raise ValueError(f"{name} has unsupported dtype {value.dtype}")
+        elif isinstance(value, numbers.Number):
+            # Complex was explicitly left unsupported; every other Python
+            # number follows Megatron's weak scalar promotion below.
+            if isinstance(value, complex):
+                raise ValueError(f"{name} has unsupported dtype complex")
+        else:
+            raise TypeError(f"{name} must be a tensor or a number")
+
+    input_is_tensor = isinstance(input, torch.Tensor)
+    bias_is_tensor = isinstance(bias, torch.Tensor)
+    if not input_is_tensor and not bias_is_tensor:
+        # Megatron's torch.tanh also needs one tensor operand.
+        raise TypeError("at least one of input and bias must be a tensor")
+    if not input_is_tensor:
+        input = _as_scalar_tensor(input, bias, "input")
+    elif not bias_is_tensor:
+        bias = _as_scalar_tensor(bias, input, "bias")
+
+    input, bias, result_device = _check_devices(input, bias)
+    sum_dtype, out_dtype = _resolve_dtypes(input, bias)
+    kernel_dtype = torch.uint8 if sum_dtype == torch.bool else sum_dtype
+    bool_sum = sum_dtype == torch.bool
 
     vector_bias = input.ndim and bias.ndim == 1 and bias.numel() == input.shape[-1]
     if vector_bias:
@@ -182,91 +323,54 @@ def bias_gelu_impl(input, bias):
             raise ValueError(
                 "input and bias must have broadcast-compatible shapes"
             ) from None
-    out = (
-        input.new_empty(x.shape)
-        if _IS_ASCEND
-        else torch.empty(x.shape, dtype=input_dtype, device=input_device)
-    )
+    x = x.to(kernel_dtype)
+    b = b.to(kernel_dtype)
     n = x.numel()
+
     if not n:
-        return out
+        return torch.empty(x.shape, dtype=out_dtype, device=result_device)
+
+    compute_device = result_device
+    if result_device.type == "cpu":
+        # Megatron accepts CPU operands; Triton has no CPU backend, so stage
+        # the already-promoted operands and copy the result back.
+        compute_device = _accelerator_device()
+        x = x.to(compute_device)
+        b = b.to(compute_device)
 
     h = x.shape[-1] if x.ndim else 1
     if vector_bias:
-        b, mode = bias.contiguous(), 1
-    elif bias.numel() == 1:
-        b, mode = bias.contiguous(), 0
+        b, mode = b.contiguous(), 1
+    elif b.numel() == 1:
+        b, mode = b.contiguous(), 0
     elif b.stride(-1) == 1 and all(s == 0 for s in b.stride()[:-1]):
         # Preserve a shared bias row instead of copying its full broadcast.
         b, mode = b.reshape(-1, h)[0].contiguous(), 1
     else:
         b, mode = b.contiguous(), 2
     x = x.contiguous()
-    if _IS_ASCEND:
-        # FlagTree wraps its integer helpers in JIT dispatch; these launch
-        # dimensions are host integers and need only ordinary Python arithmetic.
-        lanes = (n + CORE_NUM - 1) // CORE_NUM
-        block = min(16384, max(128, 1 << (lanes - 1).bit_length()))
-        # Low-precision non-power-of-two rows can waste nearly half a large
-        # tile (e.g. H=11008). A 4096-lane tile reduces masked UB work.
-        if (
-            input_dtype != torch.float32
-            and mode == 1
-            and h >= 128
-            and block > 4096
-            and not (h <= block and h & (h - 1) == 0)
-            and ((h + block - 1) // block) * block * 8 > h * 9
-        ):
-            block = 4096
-        if mode == 1 and h >= 128 and not (h <= block and h & (h - 1) == 0):
-            tiles = (n // h) * ((h + block - 1) // block)
-        else:
-            tiles = (n + block - 1) // block
-        grid = (min(tiles, CORE_NUM),)
-    else:
-        block = _BLOCK_SIZE
-        if n >= 65536:
-            # Share GPU tiling across vendors; FP32 favors a smaller tile.
-            block = 1024 if input_dtype == torch.float32 else 2048
-        grid = (triton.cdiv(n, block),)
-    # A tensor on the current NPU needs no device exchange. Keep the guard for
-    # cross-device calls and leave every non-Ascend launch on its original path.
-    context = (
-        nullcontext()
-        if _IS_ASCEND and torch_device_fn.current_device() == input_device.index
-        else torch_device_fn.device(input_device)
-    )
-    with context:
-        if _IS_ASCEND:
-            # Same LibEntry.run path as kernel[grid], without its temporary
-            # closure/dict merge. warmup=False is required on cold JIT misses.
-            _bias_gelu_forward_kernel.run(
-                x,
-                b,
-                out,
-                n,
-                h,
-                mode,
-                grid=grid,
-                warmup=False,
-                BLOCK=block,
-                PERSISTENT=True,
-                num_warps=_NUM_WARPS,
-                num_stages=1,
-                EVEN=n % block == 0 and (mode != 1 or h % block == 0),
-            )
-        else:
-            _bias_gelu_forward_kernel[grid](
-                x,
-                b,
-                out,
-                n,
-                h,
-                mode,
-                BLOCK=block,
-                PERSISTENT=_IS_ASCEND,
-                num_warps=_NUM_WARPS,
-                EVEN=n % block == 0,
-                **({"num_stages": 1} if _IS_ASCEND else {}),
-            )
-    return out
+    out = torch.empty(x.shape, dtype=out_dtype, device=compute_device)
+
+    block = _BLOCK_SIZE
+    if n >= 65536:
+        # Share GPU tiling across vendors; FP32 favors a smaller tile.
+        block = 1024 if sum_dtype == torch.float32 else 2048
+    grid = (triton.cdiv(n, block),)
+    integral = sum_dtype in _INTEGRAL_DTYPES
+    fp64 = sum_dtype == torch.float64
+    with torch_device_fn.device(compute_device):
+        _bias_gelu_forward_kernel[grid](
+            x,
+            b,
+            out,
+            n,
+            h,
+            mode,
+            BLOCK=block,
+            num_warps=_NUM_WARPS,
+            EVEN=n % block == 0,
+            INTEGRAL=integral,
+            BOOL_SUM=bool_sum,
+            FP64=fp64,
+        )
+    return out.to(result_device) if result_device.type == "cpu" else out

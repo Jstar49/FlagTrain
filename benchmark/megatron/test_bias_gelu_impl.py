@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Benchmark bias_gelu_impl against the installed Megatron-Core operator."""
+"""Benchmark bias_gelu_impl against the installed Megatron-Core operator.
+
+Two bias shapes are timed. ``[hidden]`` is the vector Megatron's MLP uses and
+the kernel's shared-row path; a full-size bias is the kernel's elementwise
+path, which reads a second tensor as large as the input.
+"""
 
 import pytest
 import torch
@@ -29,6 +34,16 @@ _CORE_SHAPES = [
     (16, 128, 8192),
     (256, 32768),
 ]
+
+# The full-size bias is timed where it exercises a different tiling: a square
+# tile, the 3-D layout, a non-power-of-two hidden, and a hidden wider than one
+# tile. Each row costs about as long as its vector-bias sibling.
+_FULL_BIAS_SHAPES = {
+    (4096, 4096),
+    (16, 128, 8192),
+    (2048, 11008),
+    (256, 32768),
+}
 
 
 def _dtypes():
@@ -50,6 +65,13 @@ def bias_gelu_input_fn(shape, dtype, device):
         torch.randn(shape, dtype=dtype, device=device),
         torch.randn(shape[-1], dtype=dtype, device=device),
     )
+    if tuple(shape) in _FULL_BIAS_SHAPES:
+        # A bias with no broadcast row to share: every element is read, which is
+        # the elementwise path rather than the row-shared one above.
+        yield (
+            torch.randn(shape, dtype=dtype, device=device),
+            torch.randn(shape, dtype=dtype, device=device),
+        )
 
 
 @pytest.mark.bias_gelu_impl
