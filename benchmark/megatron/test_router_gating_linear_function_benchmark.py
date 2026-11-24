@@ -64,7 +64,6 @@ def _build_inputs(plan, dtype, device):
     return make_inputs(shape, dtype, device, with_bias, num_experts)
 
 
-@pytest.mark.skipif(flag_train.vendor_name != "nvidia", reason="NVIDIA Router kernel")
 @pytest.mark.router_gating_linear_function
 def test_router_gating_linear_function_perf():
     bench = RouterGatingLinearBenchmark(

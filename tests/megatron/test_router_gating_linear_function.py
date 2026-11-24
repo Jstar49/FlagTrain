@@ -23,12 +23,10 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.reference_candidate import get_candidate
 from flag_train.runtime import torch_backend_device
 from flag_train.testing import assert_close
 
 OP_NAME = "router_gating_linear_function"
-OVERRIDE_KEY = f"megatron.{OP_NAME}"
 WORKLOADS = (
     ((16, 32), 13),
     ((2, 5, 32), 13),
@@ -84,8 +82,8 @@ class _RouterGatingLinear(torch.autograd.Function):
     def backward(ctx, grad_output):
         inp, weight, bias = ctx.saved_tensors
         router_dtype = ctx.router_dtype
-        grad_rows = grad_output.reshape(-1, weight.size(0))
-        input_rows = inp.reshape(-1, inp.size(-1)).to(router_dtype)
+        grad_rows = grad_output.flatten(end_dim=-2)
+        input_rows = inp.flatten(end_dim=-2).to(router_dtype)
         grad_input = torch.mm(grad_rows, weight.to(router_dtype)).to(inp.dtype)
         grad_weight = torch.mm(grad_rows.t(), input_rows).to(weight.dtype)
         # Megatron rounds the bias gradient to weight.dtype before autograd
@@ -98,15 +96,10 @@ def reference(inp, weight, bias, router_dtype):
     return _RouterGatingLinear.apply(inp, weight, bias, router_dtype)
 
 
-pytestmark = pytest.mark.skipif(
-    flag_train.vendor_name != "nvidia", reason="NVIDIA Router kernel"
-)
-
-
 @pytest.fixture(autouse=True)
 def _matmul_precision():
-    # Save and restore cuBLAS settings through their accessors.
-    matmul = torch_backend_device.matmul
+    # Some backends do not expose reduced-precision reduction controls.
+    matmul = getattr(torch_backend_device, "matmul", None)
     fp32_precision = torch.get_float32_matmul_precision()
     saved = {}
     try:
@@ -149,7 +142,6 @@ def _assert_fp32_reduction_close(actual, expected, reduction_size):
 @pytest.mark.parametrize("router_dtype", DTYPES)
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "bias"])
 def test_router_gating_linear_function(shape, num_experts, router_dtype, with_bias):
-    candidate = get_candidate(OVERRIDE_KEY, reference=reference)
 
     inp, weight, bias, _ = make_inputs(
         shape, router_dtype, flag_train.device, with_bias, num_experts
@@ -159,7 +151,9 @@ def test_router_gating_linear_function(shape, num_experts, router_dtype, with_bi
     reference_inputs = tuple(tensor.clone().requires_grad_() for tensor in inputs)
     candidate_bias = candidate_inputs[2] if with_bias else None
     reference_bias = reference_inputs[2] if with_bias else None
-    actual = candidate(*candidate_inputs[:2], candidate_bias, router_dtype)
+    actual = flag_train.megatron.router_gating_linear_function(
+        *candidate_inputs[:2], candidate_bias, router_dtype
+    )
     expected = reference(*reference_inputs[:2], reference_bias, router_dtype)
     if router_dtype == torch.float32:
         _assert_fp32_reduction_close(actual, expected, inp.size(-1))
@@ -196,6 +190,7 @@ def test_router_gating_linear_function(shape, num_experts, router_dtype, with_bi
         torch.testing.assert_close(actual_input, original, rtol=0, atol=0)
 
 
+@pytest.mark.router_gating_linear_function
 def test_router_gating_linear_noncontiguous():
     def strided(tensor):
         return tensor.repeat_interleave(2, dim=-1)[..., ::2]
@@ -203,17 +198,25 @@ def test_router_gating_linear_noncontiguous():
     inp, weight, bias, dtype = make_inputs(
         (2, 5, 32), torch.float32, flag_train.device, True, 13
     )
-    inputs = tuple(strided(tensor).requires_grad_() for tensor in (inp, weight, bias))
-    actual = flag_train.megatron.router_gating_linear_function(*inputs, dtype)
-    expected = reference(*inputs, dtype)
+    originals = (inp, weight, bias)
+    candidate_inputs = tuple(strided(tensor).requires_grad_() for tensor in originals)
+    reference_inputs = tuple(strided(tensor).requires_grad_() for tensor in originals)
+    actual = flag_train.megatron.router_gating_linear_function(*candidate_inputs, dtype)
+    expected = reference(*reference_inputs, dtype)
     torch.testing.assert_close(actual, expected)
-    grad = strided(torch.randn_like(expected))
+    grad = torch.randn_like(expected)
+    candidate_grad = strided(grad)
     torch.testing.assert_close(
-        torch.autograd.grad(actual, inputs, grad),
-        torch.autograd.grad(expected, inputs, grad),
+        torch.autograd.grad(actual, candidate_inputs, candidate_grad),
+        torch.autograd.grad(expected, reference_inputs, strided(grad)),
     )
+    for actual_value, original_value in zip(
+        (*candidate_inputs, candidate_grad), (*originals, grad)
+    ):
+        torch.testing.assert_close(actual_value, original_value, rtol=0, atol=0)
 
 
+@pytest.mark.router_gating_linear_function
 def test_router_gating_linear_empty_reduction_with_bias():
     device = flag_train.device
     inp = torch.empty((2, 0), device=device, dtype=torch.bfloat16, requires_grad=True)
