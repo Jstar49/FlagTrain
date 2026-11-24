@@ -52,6 +52,16 @@ needs_extension = pytest.mark.skipif(
     not _HAVE_EXTENSION,
     reason="Megatron's Apex scaled-softmax CUDA extension is not installed",
 )
+# Hygon's apex-das computes the full-mask ``scale_value`` but never multiplies
+# it into the stored result, so a fully masked row comes back as a uniform
+# distribution instead of zeros. That is a vendor bug in the HIP port, not in
+# FlagTrain; skip the oracle-calibration case there until it is fixed. The
+# kernel's own full-mask contract is covered by
+# ``test_fully_masked_rows_are_zero``.
+hygon_apex_full_mask = pytest.mark.skipif(
+    flag_train.vendor_name == "hygon",
+    reason="Hygon Apex HIP port omits upstream's full-mask scale_value multiply",
+)
 
 _DTYPES = [torch.float16]
 if utils.bf16_is_supported:
@@ -476,6 +486,7 @@ def test_matches_megatron(shape, dtype):
 
 
 @needs_extension
+@hygon_apex_full_mask
 @pytest.mark.scaled_masked_softmax_cuda_forward
 @pytest.mark.parametrize("dtype", _EXT_DTYPES)
 def test_vendored_baseline_matches_torch(dtype):
