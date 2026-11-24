@@ -34,6 +34,7 @@ if runtime_device.vendor_name == "ascend":
 @pointwise_dynamic(
     is_tensor=[True, False],
     dtypes=[None, float],
+    # Store the FP32 result in x's dtype, which truncates it for int32.
     promotion_methods=[(0, "NO_OPMATH")],
     config=_CONFIG,
 )
@@ -45,19 +46,46 @@ def _tanh_soft_clamp_kernel(x, scale):
     return scale_fp32 * tl_extra_shim.tanh(x_fp32 * inv_scale)
 
 
+@pointwise_dynamic(
+    is_tensor=[True, True],
+    promotion_methods=[(0, "NO_OPMATH")],
+    config=_CONFIG,
+)
+@triton.jit
+def _tanh_soft_clamp_int32_tensor_scale_kernel(x, scale):
+    return scale * tl_extra_shim.tanh(x.to(tl.float32) / scale)
+
+
 def tanh_soft_clamp(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Clamp a floating-point or int32 tensor with a scalar or broadcastable scale."""
     logger.debug("TRAIN TANH_SOFT_CLAMP")
     if not isinstance(x, torch.Tensor):
         raise TypeError(f"tanh_soft_clamp expects a tensor, got {type(x).__name__}")
-    if not x.is_floating_point():
+    if x.dtype != torch.int32 and not x.is_floating_point():
         raise TypeError(
-            f"tanh_soft_clamp only supports floating-point tensors, got {x.dtype}"
+            f"tanh_soft_clamp only supports floating-point or int32 tensors, got {x.dtype}"
         )
     if x.device.type != runtime_device.name:
         raise ValueError(
             f"tanh_soft_clamp only supports {runtime_device.name} tensors, "
             f"got {x.device.type}"
         )
+    if isinstance(scale, torch.Tensor):
+        if (
+            x.dtype == torch.int32
+            and scale.device == x.device
+            and scale.layout == torch.strided
+            and not scale.is_complex()
+        ):
+            # Match the fused division before integer truncation. A zero-dimensional
+            # scale does not promote a higher-rank FP32 activation to FP64.
+            scale_dtype = torch.float32
+            if scale.ndim or x.ndim == 0:
+                scale_dtype = torch.promote_types(scale_dtype, scale.dtype)
+            return _tanh_soft_clamp_int32_tensor_scale_kernel(
+                x.contiguous(), scale.to(scale_dtype).contiguous()
+            )
+        return (scale * torch.tanh(x.float() / scale)).to(x.dtype)
     if not x.is_contiguous():
         x = x.contiguous()
     return _tanh_soft_clamp_kernel(x, float(scale))

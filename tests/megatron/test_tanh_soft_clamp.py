@@ -117,6 +117,70 @@ def _check_forward(x, scale):
     _assert_close(out, ref_out, dtype)
 
 
+@pytest.fixture
+def megatron_tanh_soft_clamp():
+    activations = pytest.importorskip("megatron.core.activations")
+    native = getattr(activations, "tanh_soft_clamp", None)
+    if native is None:
+        pytest.skip("Native tanh_soft_clamp needs megatron-core >= 0.20.0")
+    return native
+
+
+def _check_native_forward(native, x, scale):
+    expected = native(x, scale)
+    actual = flag_train.megatron.tanh_soft_clamp(x, scale)
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype == x.dtype
+    assert actual.device == expected.device == x.device
+    expected = utils.to_reference(expected)
+    if x.dtype == torch.int32:
+        utils.train_assert_equal(actual, expected)
+    else:
+        utils.train_assert_close(actual, expected, x.dtype)
+
+
+@pytest.mark.tanh_soft_clamp
+@pytest.mark.parametrize("scale, transpose", [(2.0, False), (2.5, True), (-2.5, False)])
+def test_tanh_soft_clamp_int32_native(megatron_tanh_soft_clamp, scale, transpose):
+    x = torch.tensor(
+        [[-3, -1, 0], [1, 2, 3]], dtype=torch.int32, device=flag_train.device
+    )
+    if transpose:
+        x = x.t()
+        assert not x.is_contiguous()
+    _check_native_forward(megatron_tanh_soft_clamp, x, scale)
+
+
+@pytest.mark.tanh_soft_clamp
+@pytest.mark.parametrize(
+    "dtype, scale_values, narrow_input",
+    [
+        pytest.param(torch.float32, 2.0, False, id="zero-dimensional"),
+        pytest.param(torch.float32, [0.5, 2.0, 3.5], False, id="broadcast"),
+        pytest.param(torch.float32, [0.5, 2.0, 3.5], True, id="expands-input"),
+        pytest.param(torch.int32, [0.5, 2.0, 3.5], False, id="int32-broadcast"),
+    ],
+)
+def test_tanh_soft_clamp_tensor_scale_native(
+    megatron_tanh_soft_clamp, dtype, scale_values, narrow_input
+):
+    x = torch.tensor([[-3, -1, 0], [1, 2, 3]], dtype=dtype, device=flag_train.device)
+    if narrow_input:
+        x = x[:, :1]
+    scale = torch.tensor(scale_values, dtype=torch.float32, device=x.device)
+    _check_native_forward(megatron_tanh_soft_clamp, x, scale)
+
+
+@pytest.mark.tanh_soft_clamp
+def test_tanh_soft_clamp_int32_tensor_scale_rounding(megatron_tanh_soft_clamp):
+    x = torch.tensor([5, -4764], dtype=torch.int32, device=flag_train.device)
+    scale = torch.tensor(
+        [30427.671875, 28793.58984375], dtype=torch.float32, device=x.device
+    )
+    _check_native_forward(megatron_tanh_soft_clamp, x, scale)
+
+
 @pytest.mark.tanh_soft_clamp
 @pytest.mark.parametrize("shape", _SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
