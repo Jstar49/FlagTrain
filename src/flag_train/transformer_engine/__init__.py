@@ -1,8 +1,10 @@
 """Transformer Engine operators."""
 
+from .l2_normalization import l2_normalization
 from .l2_normalization_backward import l2_normalization_backward
 
 __all__ = [
+    "l2_normalization",
     "l2_normalization_backward",
 ]
 

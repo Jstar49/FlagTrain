@@ -313,6 +313,20 @@ ops:
   source: megatron.core.transformer.hyper_connection
   stages:
   - stable: '0.0.0'
+- id: l2_normalization
+  description: Last-dimension L2 normalization with first-order input gradients.
+  for:
+  - L2Normalization
+  labels:
+  - transformer_engine
+  - normalization
+  from:
+  - transformer_engine
+  kind:
+  - Normalization
+  source: transformer_engine.pytorch.ops.basic.l2normalization
+  stages:
+  - stable: '0.0.0'
 - id: l2_normalization_backward
   description: Input gradient for L2 normalization using the saved inverse norm.
   for:
