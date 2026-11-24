@@ -384,20 +384,16 @@ def test_multi_tensor_lion_matches_reference(dtype):
 
 
 @pytest.mark.multi_tensor_lion
-def test_multi_tensor_lion_mixed_dtypes():
-    """A single call may mix dtypes; the implementation groups by dtype and
-    launches once per group (mirroring FusedLion.step). DeepSpeed's op itself
-    is always called per dtype group, so the torch reference is the oracle."""
+def test_multi_tensor_lion_mixed_dtypes_rejected():
+    """The raw DeepSpeed op assumes one dtype per call; FusedLion.step does the
+    grouping above it. The Triton port follows the raw op and rejects a mixed
+    call instead of silently reinterpreting the operands."""
     gs32, ps32, ms32 = _make_triplet(2, 4096, torch.float32)
     gs16, ps16, ms16 = _make_triplet(2, 4096, torch.float16)
     gs, ps, ms = gs32 + gs16, ps32 + ps16, ms32 + ms16
 
-    train_gs, train_ps, train_ms = _clone_lists(gs, ps, ms)
-    _step(flag_train.deepspeed.multi_tensor_lion, train_gs, train_ps, train_ms, 1)
-
-    ref_gs, ref_ps, ref_ms = _reference_lists(gs, ps, ms)
-    _step(multi_tensor_lion_ref, ref_gs, ref_ps, ref_ms, 1)
-    _assert_step_matches(train_ps, train_ms, ref_ps, ref_ms)
+    with pytest.raises(RuntimeError, match="one dtype"):
+        _step(flag_train.deepspeed.multi_tensor_lion, gs, ps, ms, 1)
 
 
 @pytest.mark.multi_tensor_lion
@@ -478,3 +474,126 @@ def test_reference_matches_deepspeed(dtype):
     _assert_step_matches(
         ref_ps, ref_ms, ds_ps, ds_ms, atol=_ds_atol(dtype), p_masks=p_masks
     )
+
+
+@pytest.mark.multi_tensor_lion
+def test_multi_tensor_lion_rejects_invalid_inputs():
+    """The raw-op contract rejects the inputs DeepSpeed's multi_tensor_apply
+    rejects, instead of relying on assert or producing out-of-bounds accesses."""
+    gs, ps, ms = _make_triplet(1, 1024, torch.float32)
+
+    def call(lists, chunk_size=_CHUNK_SIZE):
+        return flag_train.deepspeed.multi_tensor_lion(
+            chunk_size,
+            _noop_flag(),
+            lists,
+            _LR,
+            _BETA1,
+            _BETA2,
+            1,
+            _WEIGHT_DECAY,
+        )
+
+    with pytest.raises(RuntimeError, match="at least one tensor"):
+        call([[], [], []])
+    with pytest.raises(RuntimeError, match="3 tensor lists"):
+        call([gs, ps])
+    with pytest.raises(RuntimeError, match="same length"):
+        call([gs, ps, []])
+    with pytest.raises(RuntimeError, match="one dtype"):
+        call([gs, ps, [t.to(torch.float16) for t in ms]])
+    with pytest.raises(RuntimeError, match="elements"):
+        call(
+            [
+                gs,
+                ps,
+                [torch.empty(3, dtype=torch.float32, device=flag_train.device)],
+            ]
+        )
+    noncontiguous = [
+        torch.randn(2048, dtype=torch.float32, device=flag_train.device)[::2]
+    ]
+    with pytest.raises(RuntimeError, match="contiguous"):
+        call([gs, ps, noncontiguous])
+    if flag_train.device != "cpu":
+        with pytest.raises(RuntimeError, match="one device"):
+            call([gs, ps, [torch.empty(1024, dtype=torch.float32)]])
+    with pytest.raises(ValueError, match="chunk_size"):
+        call([gs, ps, ms], chunk_size=0)
+    with pytest.raises(TypeError, match="chunk_size"):
+        call([gs, ps, ms], chunk_size=1.5)
+
+    # DeepSpeed launches no blocks for all-empty tensors; this must be a no-op.
+    empty = [torch.empty(0, dtype=torch.float32, device=flag_train.device)]
+    call([empty, empty, empty])
+
+
+@pytest.mark.multi_tensor_lion
+def test_multi_tensor_lion_channels_last():
+    """channels_last storage is contiguous memory, which is what the raw op
+    accepts; the elementwise kernel can read it as a flat buffer."""
+    shape = (2, 4, 8, 16)
+    device = flag_train.device
+    try:
+        gs = [
+            torch.randn(shape, dtype=torch.float32, device=device).to(
+                memory_format=torch.channels_last
+            )
+        ]
+        ps = [
+            torch.randn(shape, dtype=torch.float32, device=device).to(
+                memory_format=torch.channels_last
+            )
+        ]
+        ms = [
+            torch.zeros(shape, dtype=torch.float32, device=device).to(
+                memory_format=torch.channels_last
+            )
+        ]
+    except RuntimeError as exc:
+        # Some backends only implement contiguous storage (torch-npu:
+        # "Only contiguous_format or preserve_format is supported"), so the
+        # layout this case pins cannot exist there at all.
+        if "contiguous_format" not in str(exc):
+            raise
+        pytest.skip(f"channels_last tensors cannot be created on {device!r}: {exc}")
+    assert not gs[0].is_contiguous()
+    assert gs[0].is_contiguous(memory_format=torch.channels_last)
+
+    p_masks = _sign_safe_mask(gs, ms)
+    train_gs, train_ps, train_ms = _clone_lists(gs, ps, ms)
+    _step(flag_train.deepspeed.multi_tensor_lion, train_gs, train_ps, train_ms, 1)
+
+    ref_gs, ref_ps, ref_ms = _reference_lists(gs, ps, ms)
+    _step(multi_tensor_lion_ref, ref_gs, ref_ps, ref_ms, 1)
+    _assert_step_matches(train_ps, train_ms, ref_ps, ref_ms, p_masks=p_masks)
+
+
+@pytest.mark.multi_tensor_lion
+@pytest.mark.skipif(not utils.fp64_is_supported, reason="device does not support fp64")
+def test_multi_tensor_lion_fp64():
+    """fp64 storage uses the same fp32 intermediate math as DeepSpeed."""
+    gs, ps, ms = _make_triplet(2, 4096, torch.float64, m_init="zeros")
+    p_masks = _sign_safe_mask(gs, ms)
+
+    train_gs, train_ps, train_ms = _clone_lists(gs, ps, ms)
+    _step(flag_train.deepspeed.multi_tensor_lion, train_gs, train_ps, train_ms, 1)
+
+    ref_gs, ref_ps, ref_ms = _reference_lists(gs, ps, ms)
+    _step(multi_tensor_lion_ref, ref_gs, ref_ps, ref_ms, 1)
+
+    for train_p, ref_p, mask in zip(train_ps, ref_ps, p_masks):
+        keep = utils.to_reference(mask)
+        utils.train_assert_close(
+            utils.to_reference(train_p)[keep],
+            utils.to_reference(ref_p)[keep],
+            torch.float64,
+            atol=1e-4,
+        )
+    for train_m, ref_m in zip(train_ms, ref_ms):
+        utils.train_assert_close(
+            utils.to_reference(train_m),
+            utils.to_reference(ref_m),
+            torch.float64,
+            atol=1e-4,
+        )

@@ -12,6 +12,12 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.deepspeed.multi_tensor_adam import (
+    _SUPPORTED_DTYPES,
+    _check_chunk_size,
+    _unpack_tensor_lists,
+    _validate_tensor_lists,
+)
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
@@ -27,8 +33,6 @@ _BLOCK_MIN = 512
 _LANES_PER_PROGRAM = 16384
 _MIN_PROGRAMS = 32
 _MAX_WALK_PROGRAMS = 2048
-
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def _next_pow2(n):
@@ -378,18 +382,27 @@ def multi_tensor_adam(
 
     Same contract as ``flag_train.deepspeed.multi_tensor_adam``; betas,
     epsilon, weight decay and mode are baked, ``lr``/``bc1``/``bc2`` are
-    runtime.
+    runtime. ``chunk_size`` is accepted for interface parity and ignored.
     """
     logger.debug("TRAIN_ASCEND MULTI_TENSOR_ADAM")
-
-    g_list, p_list, m_list, v_list = tensor_lists
-    if not g_list:
-        return
-
-    dtype = g_list[0].dtype
-    assert (
-        dtype in _SUPPORTED_DTYPES
-    ), f"multi_tensor_adam only supports fp16/bf16/fp32, got {dtype}"
+    _check_chunk_size(chunk_size, "multi_tensor_adam")
+    g_list, p_list, m_list, v_list = _unpack_tensor_lists(
+        tensor_lists, 4, "multi_tensor_adam"
+    )
+    dtype, _ = _validate_tensor_lists(
+        (g_list, p_list, m_list, v_list),
+        "multi_tensor_adam",
+        expected_device=runtime_device.name,
+    )
+    if dtype not in _SUPPORTED_DTYPES:
+        raise RuntimeError(
+            "multi_tensor_adam only supports fp64/fp32/fp16/bf16, got " f"{dtype}"
+        )
+    if dtype == torch.float64 and not runtime_device.support_fp64:
+        raise RuntimeError(
+            f"multi_tensor_adam cannot run fp64 on {runtime_device.name}: "
+            "the backend reports no fp64 support"
+        )
 
     if bias_correction == 1:
         bc1 = 1.0 - beta1**step
@@ -398,21 +411,13 @@ def multi_tensor_adam(
         bc1 = 1.0
         bc2 = 1.0
 
-    for g, p, m, v in zip(g_list, p_list, m_list, v_list):
-        assert g.is_contiguous() and p.is_contiguous()
-        assert m.is_contiguous() and v.is_contiguous()
-        assert g.dtype == p.dtype == m.dtype == v.dtype
-        assert (
-            p.device.type == runtime_device.name
-        ), f"multi_tensor_adam only supports {runtime_device.name} tensors"
-
     groups = {}
     itemsize = g_list[0].element_size()
     for g, p, m, v in zip(g_list, p_list, m_list, v_list):
         block = _block_for(g.numel(), itemsize)
         if block == 0:
             continue
-        groups.setdefault((p.dtype, block), []).append((g, p, m, v))
+        groups.setdefault((dtype, block), []).append((g, p, m, v))
 
     values = (float(lr), float(bc1), float(bc2))
     consts = (

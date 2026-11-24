@@ -12,6 +12,12 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_train.deepspeed.multi_tensor_lion import (
+    _SUPPORTED_DTYPES,
+    _check_chunk_size,
+    _unpack_tensor_lists,
+    _validate_tensor_lists,
+)
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
@@ -312,18 +318,26 @@ def multi_tensor_lion(
 
     Same contract as ``flag_train.deepspeed.multi_tensor_lion``; ``lr`` is
     the only runtime scalar, so the betas and weight decay are baked and a
-    caller that changes one pays one recompile.
+    caller that changes one pays one recompile. ``chunk_size`` is accepted for
+    interface parity and ignored.
     """
     logger.debug("TRAIN_ASCEND MULTI_TENSOR_LION")
-
-    g_list, p_list, m_list = tensor_lists
-    assert len(g_list) == len(p_list) == len(m_list) and len(g_list) > 0
-    for g, p, m in zip(g_list, p_list, m_list):
-        assert g.is_contiguous() and p.is_contiguous() and m.is_contiguous()
-        assert g.dtype == p.dtype == m.dtype
-        assert (
-            p.device.type == runtime_device.name
-        ), f"multi_tensor_lion only supports {runtime_device.name} tensors"
+    _check_chunk_size(chunk_size, "multi_tensor_lion")
+    g_list, p_list, m_list = _unpack_tensor_lists(tensor_lists, 3, "multi_tensor_lion")
+    dtype, _ = _validate_tensor_lists(
+        (g_list, p_list, m_list),
+        "multi_tensor_lion",
+        expected_device=runtime_device.name,
+    )
+    if dtype not in _SUPPORTED_DTYPES:
+        raise RuntimeError(
+            "multi_tensor_lion only supports fp64/fp32/fp16/bf16, got " f"{dtype}"
+        )
+    if dtype == torch.float64 and not runtime_device.support_fp64:
+        raise RuntimeError(
+            f"multi_tensor_lion cannot run fp64 on {runtime_device.name}: "
+            "the backend reports no fp64 support"
+        )
 
     groups = {}
     itemsize = g_list[0].element_size()
@@ -331,7 +345,7 @@ def multi_tensor_lion(
         block = _block_for(g.numel(), itemsize)
         if block == 0:
             continue
-        groups.setdefault((p.dtype, block), []).append((g, p, m))
+        groups.setdefault((dtype, block), []).append((g, p, m))
 
     params = (float(beta1), float(beta2), float(weight_decay))
     lr = float(lr)

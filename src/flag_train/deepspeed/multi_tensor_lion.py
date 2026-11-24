@@ -12,18 +12,132 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import numbers
 
 import torch
 import triton
 import triton.language as tl
 
-import flag_train
 from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
+
+# DeepSpeed's DISPATCH_DOUBLE_FLOAT_AND_HALF also includes BFloat16.
+_SUPPORTED_DTYPES = (
+    torch.float64,
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+)
+
+
+def _check_chunk_size(chunk_size, op_name):
+    """Validate the upstream ``chunk_size`` argument.
+
+    The Triton port accepts the argument for interface parity but ignores it:
+    results do not depend on DeepSpeed's launch segmentation. Validation still
+    rejects values DeepSpeed itself could not divide by.
+    """
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, numbers.Integral):
+        raise TypeError(
+            f"{op_name} chunk_size must be an integer, got "
+            f"{type(chunk_size).__name__}"
+        )
+    if chunk_size <= 0:
+        raise ValueError(f"{op_name} chunk_size must be positive, got {chunk_size}")
+
+
+def _unpack_tensor_lists(tensor_lists, depth, op_name):
+    """Return the ``depth`` tensor lists after checking the outer sequence."""
+    if not isinstance(tensor_lists, (list, tuple)):
+        raise TypeError(
+            f"{op_name} tensor_lists must be a list or tuple of {depth} lists"
+        )
+    if len(tensor_lists) != depth:
+        raise RuntimeError(
+            f"{op_name} expects {depth} tensor lists, got {len(tensor_lists)}"
+        )
+    for index, tensors in enumerate(tensor_lists):
+        if not isinstance(tensors, (list, tuple)):
+            raise TypeError(
+                f"{op_name} tensor_lists[{index}] must be a list or tuple of tensors"
+            )
+    return tensor_lists
+
+
+def _is_contiguous(tensor):
+    return tensor.is_contiguous() or tensor.is_contiguous(
+        memory_format=torch.channels_last
+    )
+
+
+def _validate_tensor_lists(tensor_lists, op_name, expected_device=None):
+    """Validate DeepSpeed's raw multi-tensor calling contract.
+
+    ``tensor_lists`` has already been unpacked by :func:`_unpack_tensor_lists`.
+    Returns the shared ``(dtype, device)``.
+
+    A single dtype is required. DeepSpeed dispatches its raw op from the first
+    tensor and only defines behaviour for one dtype; its optimizer classes
+    group by dtype before calling the op. Rejecting a mixed call here is a
+    deliberate, explicit version of that assumption rather than silent
+    reinterpretation of the other tensors.
+    """
+    first_list = tensor_lists[0]
+    if len(first_list) == 0:
+        raise RuntimeError(f"{op_name} requires at least one tensor per list")
+
+    for index, tensors in enumerate(tensor_lists):
+        if len(tensors) != len(first_list):
+            raise RuntimeError(
+                f"{op_name} tensor lists must have the same length; "
+                f"tensor_lists[0] has {len(first_list)}, "
+                f"tensor_lists[{index}] has {len(tensors)}"
+            )
+        for position, tensor in enumerate(tensors):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"{op_name} tensor_lists[{index}][{position}] must be a Tensor"
+                )
+
+    reference = first_list[0]
+    dtype = reference.dtype
+    device = reference.device
+    if expected_device is not None and device.type != expected_device:
+        raise RuntimeError(
+            f"{op_name} only supports {expected_device} tensors, got {device.type}"
+        )
+
+    for index, tensors in enumerate(tensor_lists):
+        for position, tensor in enumerate(tensors):
+            where = f"tensor_lists[{index}][{position}]"
+            if tensor.dtype != dtype:
+                raise RuntimeError(
+                    f"{op_name} requires one dtype per call; {where} is "
+                    f"{tensor.dtype}, expected {dtype}"
+                )
+            if tensor.device != device:
+                raise RuntimeError(
+                    f"{op_name} requires all tensors on one device; {where} is "
+                    f"on {tensor.device}, expected {device}"
+                )
+            expected_numel = first_list[position].numel()
+            if tensor.numel() != expected_numel:
+                raise RuntimeError(
+                    f"{op_name} {where} has {tensor.numel()} elements; "
+                    f"tensor_lists[0][{position}] has {expected_numel}"
+                )
+            if not _is_contiguous(tensor):
+                raise RuntimeError(
+                    f"{op_name} {where} must be contiguous or channels_last "
+                    "contiguous"
+                )
+
+    return dtype, device
+
 
 # Launch configuration swept on H20: BLOCK_SIZE 2048 with 16 warps keeps the
 # per-thread work at 4 elements, matching the ILP=4 of DeepSpeed's CUDA kernel.
@@ -188,18 +302,22 @@ def multi_tensor_lion(
     update magnitude is always exactly ``lr`` per element; it needs no second
     moment, which halves the optimizer-state memory.
 
-    Unlike a per-tensor loop, all chunks of all tensors of one dtype are fused
-    into a single kernel launch, addressed through a device-side meta buffer
-    that is cached across calls (see ``_get_metadata``).
+    All chunks of all tensors are fused into a single kernel launch, addressed
+    through a device-side meta buffer that is cached across calls (see
+    ``_get_metadata``). The raw-op contract requires one dtype across the whole
+    call; DeepSpeed's ``FusedLion.step`` groups by dtype *above* the op, so this
+    layer deliberately does not group mixed dtypes.
 
     Args:
         chunk_size (int): kept for interface parity with DeepSpeed; this
-            implementation always launches with BLOCK_SIZE=2048.
+            implementation always launches with BLOCK_SIZE=2048 and the result
+            does not depend on the upstream launch segmentation.
         noop_flag (Tensor): kept for interface parity; DeepSpeed's own noop
             check is commented out in its source, so the flag is ignored here
             as well.
         tensor_lists (list): ``[grads, params, exp_avgs]`` -- three equally
-            long lists of contiguous tensors, same dtype within each triplet.
+            long, non-empty lists of contiguous (or channels_last) tensors
+            with matching numels, one dtype and one device across the call.
         lr (float): learning rate; also the per-element update magnitude.
         beta1 (float): momentum coefficient used to build the update direction.
         beta2 (float): momentum coefficient for the exp_avg update itself.
@@ -208,39 +326,38 @@ def multi_tensor_lion(
         weight_decay (float): decoupled weight decay coefficient.
     """
     logger.debug("TRAIN LION")
+    _check_chunk_size(chunk_size, "multi_tensor_lion")
+    g_list, p_list, m_list = _unpack_tensor_lists(tensor_lists, 3, "multi_tensor_lion")
+    dtype, device = _validate_tensor_lists(
+        (g_list, p_list, m_list),
+        "multi_tensor_lion",
+        expected_device=runtime_device.name,
+    )
+    if dtype not in _SUPPORTED_DTYPES:
+        raise RuntimeError(
+            "multi_tensor_lion only supports fp64/fp32/fp16/bf16, got " f"{dtype}"
+        )
+    if dtype == torch.float64 and not runtime_device.support_fp64:
+        raise RuntimeError(
+            f"multi_tensor_lion cannot run fp64 on {runtime_device.name}: "
+            "the backend reports no fp64 support"
+        )
 
-    g_list, p_list, m_list = tensor_lists
-    assert len(g_list) == len(p_list) == len(m_list) and len(g_list) > 0
-    for g, p, m in zip(g_list, p_list, m_list):
-        assert g.is_contiguous() and p.is_contiguous() and m.is_contiguous()
-        assert g.dtype == p.dtype == m.dtype
-        # Accept whatever the active backend calls its device -- 'cuda' on
-        # nvidia/hygon, 'npu' on ascend -- rather than hard-coding CUDA.
-        assert (
-            p.device.type == flag_train.device
-        ), f"multi_tensor_lion only supports {flag_train.device} tensors"
-
-    # Group by dtype, one launch per group (mirrors FusedLion.step).
-    groups = {}
-    for g, p, m in zip(g_list, p_list, m_list):
-        groups.setdefault(p.dtype, []).append((g, p, m))
-    for triples in groups.values():
-        gs = [t[0] for t in triples]
-        ps = [t[1] for t in triples]
-        ms = [t[2] for t in triples]
-        meta, n_tensors, n_blocks, anchor = _get_metadata(gs, ps, ms, _BLOCK_SIZE)
-        if n_blocks == 0:
-            continue
-        with torch_device_fn.device(anchor.device):
-            lion_fused_kernel[(min(n_blocks, _MAX_GRID),)](
-                meta,
-                n_tensors,
-                n_blocks,
-                lr,
-                beta1,
-                beta2,
-                weight_decay,
-                anchor=anchor,
-                BLOCK_SIZE=_BLOCK_SIZE,
-                num_warps=_NUM_WARPS,
-            )
+    meta, n_tensors, n_blocks, anchor = _get_metadata(
+        g_list, p_list, m_list, _BLOCK_SIZE
+    )
+    if n_blocks == 0:
+        return
+    with torch_device_fn.device(device):
+        lion_fused_kernel[(min(n_blocks, _MAX_GRID),)](
+            meta,
+            n_tensors,
+            n_blocks,
+            lr,
+            beta1,
+            beta2,
+            weight_decay,
+            anchor=anchor,
+            BLOCK_SIZE=_BLOCK_SIZE,
+            num_warps=_NUM_WARPS,
+        )

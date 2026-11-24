@@ -385,3 +385,144 @@ def test_multi_tensor_adam_boundary_shapes():
     )
 
     _assert_step_matches(train_p, train_m, train_v, ref_p, ref_m, ref_v, dtype)
+
+
+@pytest.mark.multi_tensor_adam
+def test_multi_tensor_adam_rejects_invalid_inputs():
+    """The raw-op contract rejects the inputs DeepSpeed's multi_tensor_apply
+    rejects, instead of silently reading out of bounds."""
+    g, p, m, v = _make_tensors([(1024,)], torch.float32)
+
+    def call(lists, chunk_size=_CHUNK_SIZE):
+        return flag_train.deepspeed.multi_tensor_adam(
+            chunk_size,
+            torch.zeros(1, dtype=torch.int32, device=flag_train.device),
+            lists,
+            _LR,
+            _BETA1,
+            _BETA2,
+            _EPS,
+            1,
+            1,
+            1,
+            _WEIGHT_DECAY,
+        )
+
+    with pytest.raises(RuntimeError, match="at least one tensor"):
+        call([[], [], [], []])
+    with pytest.raises(RuntimeError, match="4 tensor lists"):
+        call([g, p, m])
+    with pytest.raises(RuntimeError, match="same length"):
+        call([g, p, m, []])
+    with pytest.raises(RuntimeError, match="one dtype"):
+        call([g, p, m, [t.to(torch.float16) for t in v]])
+    with pytest.raises(RuntimeError, match="elements"):
+        call(
+            [
+                g,
+                p,
+                m,
+                [torch.empty(3, dtype=torch.float32, device=flag_train.device)],
+            ]
+        )
+    noncontiguous = [
+        torch.randn(2048, dtype=torch.float32, device=flag_train.device)[::2]
+    ]
+    with pytest.raises(RuntimeError, match="contiguous"):
+        call([g, p, m, noncontiguous])
+    if flag_train.device != "cpu":
+        with pytest.raises(RuntimeError, match="one device"):
+            call([g, p, m, [torch.empty(1024, dtype=torch.float32)]])
+    with pytest.raises(ValueError, match="chunk_size"):
+        call([g, p, m, v], chunk_size=0)
+    with pytest.raises(TypeError, match="chunk_size"):
+        call([g, p, m, v], chunk_size=1.5)
+
+    # DeepSpeed launches no blocks for all-empty tensors; this must be a no-op.
+    empty = [torch.empty(0, dtype=torch.float32, device=flag_train.device)]
+    call([empty, empty, empty, empty])
+
+
+@pytest.mark.multi_tensor_adam
+def test_multi_tensor_adam_channels_last():
+    """channels_last storage is contiguous memory, which is what the raw op
+    accepts; the elementwise kernel can read it as a flat buffer."""
+    shape = (2, 4, 8, 16)
+    dtype = torch.float32
+    device = flag_train.device
+    try:
+        g, p, m, v = [
+            [
+                torch.randn(shape, dtype=dtype, device=device).to(
+                    memory_format=torch.channels_last
+                )
+            ]
+            for _ in range(4)
+        ]
+    except RuntimeError as exc:
+        # Some backends only implement contiguous storage (torch-npu:
+        # "Only contiguous_format or preserve_format is supported"), so the
+        # layout this case pins cannot exist there at all.
+        if "contiguous_format" not in str(exc):
+            raise
+        pytest.skip(f"channels_last tensors cannot be created on {device!r}: {exc}")
+    m[0].zero_()
+    v[0].zero_()
+    assert not g[0].is_contiguous()
+    assert g[0].is_contiguous(memory_format=torch.channels_last)
+
+    train_g, train_p, train_m, train_v = _clone_lists(g, p, m, v)
+    _call_op(
+        flag_train.deepspeed.multi_tensor_adam,
+        train_g,
+        train_p,
+        train_m,
+        train_v,
+        1,
+        1,
+        1,
+    )
+
+    ref_g, ref_p, ref_m, ref_v = _clone_lists(g, p, m, v)
+    multi_tensor_adam_ref(
+        ref_g, ref_p, ref_m, ref_v, _LR, _BETA1, _BETA2, _EPS, 1, 1, 1, _WEIGHT_DECAY
+    )
+    _assert_step_matches(train_p, train_m, train_v, ref_p, ref_m, ref_v, dtype)
+
+
+@pytest.mark.multi_tensor_adam
+@pytest.mark.skipif(not utils.fp64_is_supported, reason="device does not support fp64")
+def test_multi_tensor_adam_fp64():
+    """fp64 storage uses the same fp32 intermediate math as DeepSpeed."""
+    dtype = torch.float64
+    g, p, m, v = _make_tensors([(1024,)], dtype)
+
+    train_g, train_p, train_m, train_v = _clone_lists(g, p, m, v)
+    _call_op(
+        flag_train.deepspeed.multi_tensor_adam,
+        train_g,
+        train_p,
+        train_m,
+        train_v,
+        1,
+        1,
+        1,
+    )
+
+    ref_g, ref_p, ref_m, ref_v = _clone_lists(g, p, m, v)
+    multi_tensor_adam_ref(
+        ref_g, ref_p, ref_m, ref_v, _LR, _BETA1, _BETA2, _EPS, 1, 1, 1, _WEIGHT_DECAY
+    )
+
+    for train, ref in (
+        (train_p, ref_p),
+        (train_m, ref_m),
+        (train_v, ref_v),
+    ):
+        for train_tensor, ref_tensor in zip(train, ref):
+            utils.train_assert_close(
+                utils.to_reference(train_tensor),
+                utils.to_reference(ref_tensor),
+                dtype,
+                atol=1e-4,
+            )

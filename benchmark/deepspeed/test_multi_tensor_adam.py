@@ -24,11 +24,11 @@ tensors rather than a single one. That is the whole point of the operator: the
 per-tensor launch cost is amortized across the batch, so the relevant axis is
 ``(n_tensors, numel_per_tensor)`` and not just ``numel``.
 
-Only fp32 and fp16 are benchmarked. DeepSpeed's CUDA op dispatches only
-fp16/fp32/fp64 via ``DISPATCH_DOUBLE_FLOAT_AND_HALF`` and has no bf16 kernel, so
-a bf16 case would compare the Triton op against a different arithmetic path
-rather than an apples-to-apples baseline. The Triton op *does* support bf16 --
-that is covered by the correctness tests, not here.
+fp32, fp16 and (when the backend supports it) bf16 are benchmarked. DeepSpeed's
+raw CUDA op dispatches fp64/fp32/fp16/bf16 via
+``DISPATCH_DOUBLE_FLOAT_AND_HALF``, whose macro includes ``BFloat16`` despite
+its name; ``FusedAdam`` groups bf16 tensors into that same op, so bf16 is an
+apples-to-apples baseline.
 """
 
 import warnings
@@ -206,10 +206,14 @@ def test_multi_tensor_adam_perf():
         # None when DeepSpeed is unavailable: a torch composition is not timed
         # as a baseline, so --base-data supplies the comparison.
         torch_op=torch_op,
-        # DeepSpeed's CUDA op has no bf16 kernel, so only fp32/fp16 give an
-        # apples-to-apples baseline. The Triton op supports bf16 too; that is
-        # covered by the correctness tests.
-        dtypes=[torch.float32, torch.float16],
+        # DeepSpeed's raw op supports bf16 (its dispatch macro includes
+        # BFloat16), so bf16 is an apples-to-apples case where the backend
+        # supports it.
+        dtypes=[
+            torch.float32,
+            torch.float16,
+            *([torch.bfloat16] if flag_train.runtime.device.support_bf16 else []),
+        ],
     )
     bench.set_train(train_op)
     bench.run()
