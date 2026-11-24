@@ -29,8 +29,11 @@ side. Tolerances are ``train_assert_close``'s defaults.
 
 Only the forward output is checked: the backward is a separate operator. The
 ``fp8_input_store`` and ``cpu_offload_input`` flags stay for Megatron-LM
-signature compatibility but have nothing left to save, so passing either one is
-expected to raise. ``bias`` must have the same dtype as ``input``.
+signature compatibility and are ignored by the forward. The Triton kernel now
+covers fp64 and mixed bias dtypes as well; a CPU tensor is copied to the
+active accelerator, computed, and copied back. The operator is compared against the
+same Megatron entry point when available, and against the eager reference
+under ``--ref cpu``.
 """
 
 import importlib.metadata
@@ -147,17 +150,21 @@ def bias_swiglu_ref(
     linear_clamp_scale=None,
 ):
     y = x if bias is None else x + bias
+    dtype = y.dtype
     gate, linear = torch.chunk(y, 2, dim=-1)
     if gate_clamp_scale is not None:
-        gate_v = gate_clamp_scale * torch.tanh(gate / gate_clamp_scale)
-        gate_v = gate_v * torch.sigmoid(gate)
+        gate = gate_clamp_scale * torch.tanh(gate.float() / gate_clamp_scale)
+        gate = gate * torch.sigmoid(torch.chunk(y, 2, dim=-1)[0])
         if linear_clamp_scale is not None:
-            linear = linear_clamp_scale * torch.tanh(linear / linear_clamp_scale)
-        return gate_v * linear
+            linear = linear_clamp_scale * torch.tanh(
+                linear.float() / linear_clamp_scale
+            )
+        return (gate * linear).to(dtype)
     if clamp_value is not None and clamp_value > 0:
-        return torch.nn.functional.silu(gate.clamp(max=clamp_value)) * linear.clamp(
-            min=-clamp_value, max=clamp_value
-        )
+        gate, linear = torch.chunk(y.float(), 2, dim=-1)
+        gate = gate.clamp(max=clamp_value)
+        linear = linear.clamp(min=-clamp_value, max=clamp_value)
+        return (torch.nn.functional.silu(gate) * linear).to(dtype)
     return torch.nn.functional.silu(gate) * linear
 
 
@@ -167,9 +174,13 @@ def _reference(tensor):
     return utils.to_reference(tensor.detach(), upcast=True)
 
 
-def _assert_close(actual, expected, dtype, equal_nan=False):
+def _assert_close(actual, expected, dtype, equal_nan=False, atol=1e-4):
     utils.train_assert_close(
-        utils.to_reference(actual), expected, dtype, equal_nan=equal_nan
+        utils.to_reference(actual),
+        expected,
+        dtype,
+        equal_nan=equal_nan,
+        atol=atol,
     )
 
 
@@ -188,15 +199,41 @@ def _expected_output(x, bias, **kwargs):
     return bias_swiglu_ref(x, bias, **kwargs)
 
 
-def _check_bias_swiglu(x, bias, **kwargs):
+def _check_bias_swiglu(x, bias, atol=None, **kwargs):
     dtype = x.dtype
     y = flag_train.megatron.bias_swiglu_impl(x, bias, **kwargs)
     assert y.shape[-1] * 2 == x.shape[-1]
     assert y.shape[:-1] == x.shape[:-1]
     assert y.dtype == dtype
 
-    expected = _expected_output(_reference(x), _reference(bias), **kwargs)
-    _assert_close(y, expected, dtype)
+    if atol is None:
+        atol = 2e-3 if dtype == torch.float16 else 1e-4
+    if _megatron_impl is not None and not utils.TO_CPU:
+        # Compare the port to the same-dtype upstream result: the high-precision
+        # reference would charge the extra half-precision rounding of both
+        # implementations to the tolerance.
+        expected = _megatron_impl(
+            x.contiguous(), None if bias is None else bias.contiguous(), **kwargs
+        )
+    else:
+        expected = _expected_output(_reference(x), _reference(bias), **kwargs)
+    _assert_close(y, expected, dtype, atol=atol)
+
+
+def _check_noncontiguous(x, bias, **kwargs):
+    """Compare a view-compatible non-contiguous input to the same oracle.
+
+    Megatron accepts this layout, so use its own dtype-preserving result when
+    available; the upcast reference is used only under ``--ref cpu``.
+    """
+    y = flag_train.megatron.bias_swiglu_impl(x, bias, **kwargs)
+    assert y.dtype == x.dtype
+    if _megatron_impl is not None and not utils.TO_CPU:
+        expected = _megatron_impl(x, bias, **kwargs)
+        # One fp16 ulp of Inductor's fused order is still the same contract.
+        _assert_close(y, expected, x.dtype, atol=2e-3)
+    else:
+        _check_bias_swiglu(x, bias, atol=2e-3, **kwargs)
 
 
 @pytest.mark.bias_swiglu_impl
@@ -329,62 +366,130 @@ def test_bias_swiglu_impl_noncontiguous(dtype):
     bias = torch.randn((64,), dtype=dtype, device=flag_train.device)[::2]
     assert bias.shape == (32,)
     assert not bias.is_contiguous()
-    _check_bias_swiglu(x, bias, clamp_value=2.0)
+    _check_noncontiguous(x, bias, clamp_value=2.0)
 
+    # A layout whose view(-1, hidden) is not expressible: Megatron's own
+    # entry point raises here too, so the port must not silently accept it.
     cube = torch.randn((4, 8, 16), dtype=dtype, device=flag_train.device)
     transposed = cube.transpose(0, 2)
     assert not transposed.is_contiguous()
-    assert transposed.shape[-1] % 2 == 0
-    _check_bias_swiglu(transposed, None, gate_clamp_scale=2.0)
+    with pytest.raises(RuntimeError):
+        flag_train.megatron.bias_swiglu_impl(transposed, None, gate_clamp_scale=2.0)
+    if _megatron_impl is not None:
+        with pytest.raises(RuntimeError):
+            _megatron_impl(transposed, None, gate_clamp_scale=2.0)
 
 
 @pytest.mark.bias_swiglu_impl
 def test_bias_swiglu_impl_rejects_bad_arguments():
     device = flag_train.device
     x = torch.randn((4, 8), device=device)
-    with pytest.raises(ValueError, match="rank 2 or 3"):
-        flag_train.megatron.bias_swiglu_impl(torch.randn((8,), device=device), None)
-    with pytest.raises(ValueError, match="rank 2 or 3"):
-        flag_train.megatron.bias_swiglu_impl(
-            torch.randn((1, 1, 2, 4), device=device), None
-        )
-    with pytest.raises(ValueError, match="even"):
+    for bad in (
+        torch.randn((8,), device=device),
+        torch.randn((1, 1, 2, 4), device=device),
+    ):
+        with pytest.raises(AssertionError):
+            flag_train.megatron.bias_swiglu_impl(bad, None)
+    with pytest.raises(RuntimeError):
         flag_train.megatron.bias_swiglu_impl(torch.randn((4, 7), device=device), None)
-    with pytest.raises(ValueError, match="CPU"):
-        flag_train.megatron.bias_swiglu_impl(torch.randn((4, 8)), None)
-    with pytest.raises(ValueError, match="cannot both"):
+    with pytest.raises(AssertionError):
         flag_train.megatron.bias_swiglu_impl(
             x, None, clamp_value=1.0, gate_clamp_scale=1.0
         )
-    with pytest.raises(ValueError, match="requires gate_clamp_scale"):
+    with pytest.raises(AssertionError):
         flag_train.megatron.bias_swiglu_impl(x, None, linear_clamp_scale=1.0)
-    with pytest.raises(ValueError, match="greater than zero"):
-        flag_train.megatron.bias_swiglu_impl(x, None, clamp_value=0.0)
-    with pytest.raises(ValueError, match="greater than zero"):
-        flag_train.megatron.bias_swiglu_impl(x, None, gate_clamp_scale=-1.0)
-    with pytest.raises(ValueError, match="broadcast"):
+    with pytest.raises(RuntimeError):
         flag_train.megatron.bias_swiglu_impl(x, torch.randn((3,), device=device))
     # An empty input must not skip the bias checks.
-    with pytest.raises(ValueError, match="broadcast"):
+    with pytest.raises(RuntimeError):
         flag_train.megatron.bias_swiglu_impl(
             torch.empty((0, 8), device=device), torch.randn((3,), device=device)
         )
-    # Forward only: the flags that used to control the saved activations raise.
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        flag_train.megatron.bias_swiglu_impl(x, None, fp8_input_store=True)
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        flag_train.megatron.bias_swiglu_impl(x, None, cpu_offload_input=True)
+
+
+@pytest.mark.bias_swiglu_impl
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"clamp_value": 0.0},
+        {"clamp_value": -1.0},
+        {"clamp_value": float("nan")},
+        {"clamp_value": float("inf")},
+    ],
+    ids=["zero", "negative", "nan", "inf"],
+)
+def test_bias_swiglu_impl_upstream_clamp_values(kwargs):
+    """Upstream's non-positive/NaN clamp is unclamped; +inf is a clamped no-op."""
+    x = torch.randn((8, 16), device=flag_train.device)
+    y = flag_train.megatron.bias_swiglu_impl(x, None, **kwargs)
+    expected = _expected_output(_reference(x), None, **kwargs)
+    _assert_close(y, expected, x.dtype, equal_nan=True)
+
+
+@pytest.mark.bias_swiglu_impl
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"gate_clamp_scale": -1.0},
+        {"gate_clamp_scale": 0.0},
+        {"gate_clamp_scale": float("nan")},
+        {"gate_clamp_scale": float("inf")},
+    ],
+    ids=["negative", "zero", "nan", "inf"],
+)
+def test_bias_swiglu_impl_upstream_situ_scales(kwargs):
+    """The fallback accepts the non-positive/non-finite SiTU scales upstream does."""
+    x = torch.randn((8, 16), device=flag_train.device)
+    y = flag_train.megatron.bias_swiglu_impl(x, None, **kwargs)
+    expected = _expected_output(_reference(x), None, **kwargs)
+    _assert_close(y, expected, x.dtype, equal_nan=True)
+
+
+@pytest.mark.bias_swiglu_impl
+def test_bias_swiglu_impl_ignores_forward_only_flags():
+    """fp8_input_store/cpu_offload_input only affect saved backward state."""
+    x = torch.randn((8, 16), device=flag_train.device)
+    expected = flag_train.megatron.bias_swiglu_impl(x, None)
+    for name in ("fp8_input_store", "cpu_offload_input"):
+        y = flag_train.megatron.bias_swiglu_impl(x, None, **{name: True})
+        utils.train_assert_equal(utils.to_reference(y), utils.to_reference(expected))
 
 
 @pytest.mark.bias_swiglu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_bias_swiglu_impl_requires_matching_bias_dtype(dtype):
-    """The kernel computes the add in fp32; a mixed-dtype bias would silently
-    change the promoted dtype eager PyTorch produces, so it is rejected."""
+def test_bias_swiglu_impl_mixed_bias_dtype(dtype):
+    """A mixed-dtype bias promotes the result exactly as PyTorch and upstream do."""
     device = flag_train.device
     other = torch.float32 if dtype != torch.float32 else torch.float16
     x = torch.randn((4, 8), dtype=dtype, device=device)
-    with pytest.raises(ValueError, match="input dtype"):
-        flag_train.megatron.bias_swiglu_impl(
-            x, torch.randn((8,), dtype=other, device=device)
-        )
+    bias = torch.randn((8,), dtype=other, device=device)
+    y = flag_train.megatron.bias_swiglu_impl(x, bias)
+
+    assert y.dtype == torch.promote_types(dtype, other)
+    expected = bias_swiglu_ref(_reference(x), _reference(bias))
+    _assert_close(y, expected, y.dtype)
+    if _megatron_impl is not None and not utils.TO_CPU:
+        _assert_close(y, _megatron_impl(x, bias), y.dtype)
+
+
+@pytest.mark.bias_swiglu_impl
+@pytest.mark.parametrize(
+    "dtype,device",
+    [
+        (torch.float64, flag_train.device),
+        (torch.bfloat16, "cpu"),
+        (torch.float32, "cpu"),
+    ],
+    ids=["fp64-device", "bf16-cpu", "fp32-cpu"],
+)
+def test_bias_swiglu_impl_device_and_dtype_domain(dtype, device):
+    """fp64 stays on the Triton path; CPU uses a device round trip."""
+    if (
+        device == flag_train.device
+        and dtype == torch.float64
+        and not utils.fp64_is_supported
+    ):
+        pytest.skip("fp64 is not supported on this device")
+    x = torch.randn((8, 16), dtype=dtype, device=device)
+    bias = torch.randn((16,), dtype=dtype, device=device)
+    _check_bias_swiglu(x, bias)

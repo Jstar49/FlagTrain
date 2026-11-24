@@ -47,8 +47,8 @@ _CORE_SHAPES = [
 ]
 
 
-# Enough variants for 7 shapes x 3 activations x 3 dtypes of forward cases
-# without Dynamo falling back to eager halfway through the suite.
+# Enough variants for 7 shapes x 3 activations x up to 4 dtypes of forward
+# cases without Dynamo falling back to eager halfway through the suite.
 _DYNAMO_RECOMPILE_LIMIT = 128
 
 # megatron-core 0.20 is the first release with the clamp / SiTU arguments.
@@ -114,7 +114,7 @@ _SITU_KWARGS = {"gate_clamp_scale": 4.0, "linear_clamp_scale": 2.5}
 
 
 def _dtypes():
-    """``consts.FLOAT_DTYPES`` with bf16 dropped where the backend has none.
+    """``consts.FLOAT_DTYPES`` with bf16/fp64 dropped where the backend has none.
 
     Same rule as ``utils.FLOAT_DTYPES`` in the correctness suite, so both see
     the same dtypes on every backend.
@@ -122,6 +122,8 @@ def _dtypes():
     dtypes = [dtype for dtype in consts.FLOAT_DTYPES if dtype != torch.bfloat16]
     if flag_train.runtime.device.support_bf16:
         dtypes.append(torch.bfloat16)
+    if flag_train.runtime.device.support_fp64:
+        dtypes.append(torch.float64)
     return dtypes
 
 
