@@ -24,6 +24,7 @@ from torch.nn import functional as F
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_close, assert_equal
 
 OP_NAME = "weighted_swiglu_funciton"
 OVERRIDE_KEY = f"megatron.{OP_NAME}"
@@ -85,9 +86,9 @@ def test_weighted_swiglu_funciton(shape, dtype):
     reference_inputs = tuple(tensor.clone().requires_grad_() for tensor in inputs)
     actual = candidate(*candidate_inputs)
     expected = reference(*reference_inputs)
-    torch.testing.assert_close(actual, expected)
+    assert_close(actual, expected, expected.dtype)
     for actual_input, original in zip(candidate_inputs, inputs):
-        torch.testing.assert_close(actual_input, original, rtol=0, atol=0)
+        assert_equal(actual_input, original)
         assert (
             actual.untyped_storage().data_ptr()
             != actual_input.untyped_storage().data_ptr()
@@ -98,9 +99,10 @@ def test_weighted_swiglu_funciton(shape, dtype):
     )
     actual_grads = torch.autograd.grad(actual, candidate_inputs, grad_output.clone())
     expected_grads = torch.autograd.grad(expected, reference_inputs, grad_output)
-    torch.testing.assert_close(actual_grads, expected_grads)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        assert_close(actual_grad, expected_grad, expected_grad.dtype)
     for actual_input, original in zip(candidate_inputs, inputs):
-        torch.testing.assert_close(actual_input, original, rtol=0, atol=0)
+        assert_equal(actual_input, original)
 
 
 def test_weighted_swiglu_rejects_incompatible_shapes():

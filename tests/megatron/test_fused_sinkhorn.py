@@ -26,6 +26,7 @@ from torch._dynamo import config as dynamo_config
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_close, assert_equal
 
 OP_NAME = "fused_sinkhorn"
 OVERRIDE_KEY = f"megatron.{OP_NAME}"
@@ -119,8 +120,8 @@ def test_fused_sinkhorn(shape, num_iterations, eps, dtype):
     reference_input = input_logits.clone().requires_grad_()
     actual = candidate(candidate_input, num_iterations, eps)
     expected = reference(reference_input, num_iterations, eps)
-    torch.testing.assert_close(actual, expected)
-    torch.testing.assert_close(candidate_input, input_logits, rtol=0, atol=0)
+    assert_close(actual, expected, expected.dtype)
+    assert_equal(candidate_input, input_logits)
     assert (
         actual.untyped_storage().data_ptr()
         != candidate_input.untyped_storage().data_ptr()
@@ -129,10 +130,10 @@ def test_fused_sinkhorn(shape, num_iterations, eps, dtype):
     grad_output = (
         torch.linspace(-0.8, 0.9, expected.numel()).reshape(expected.shape).to(expected)
     )
-    actual_grad = torch.autograd.grad(actual, candidate_input, grad_output.clone())
-    expected_grad = torch.autograd.grad(expected, reference_input, grad_output)
-    torch.testing.assert_close(actual_grad, expected_grad)
-    torch.testing.assert_close(candidate_input, input_logits, rtol=0, atol=0)
+    actual_grad = torch.autograd.grad(actual, candidate_input, grad_output.clone())[0]
+    expected_grad = torch.autograd.grad(expected, reference_input, grad_output)[0]
+    assert_close(actual_grad, expected_grad, expected_grad.dtype)
+    assert_equal(candidate_input, input_logits)
 
 
 def test_fused_sinkhorn_wide_matrix():
@@ -141,10 +142,10 @@ def test_fused_sinkhorn_wide_matrix():
     matrix = x.softmax(dim=-1) + 1e-6
     expected = matrix / (matrix.sum(dim=-2, keepdim=True) + 1e-6)
     upstream = torch.randn_like(actual)
-    torch.testing.assert_close(actual, expected)
+    assert_close(actual, expected, expected.dtype)
     (actual_grad,) = torch.autograd.grad(actual, x, upstream)
     (expected_grad,) = torch.autograd.grad(expected, x, upstream)
-    torch.testing.assert_close(actual_grad, expected_grad)
+    assert_close(actual_grad, expected_grad, expected_grad.dtype)
 
 
 def test_fused_sinkhorn_saves_only_logits():

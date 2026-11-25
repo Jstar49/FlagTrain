@@ -20,6 +20,7 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_close
 
 OP_NAME = "l2_normalization_backward"
 SHAPES = (
@@ -61,4 +62,4 @@ def test_l2_normalization_backward(shape, dtype):
     expected = reference(*inputs)
     actual = candidate(*inputs)
     assert actual.device == inputs[1].device
-    torch.testing.assert_close(actual, expected)
+    assert_close(actual, expected, expected.dtype)

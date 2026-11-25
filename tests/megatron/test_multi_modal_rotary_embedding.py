@@ -25,6 +25,7 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_close, assert_equal
 
 OP_NAME = "multi_modal_rotary_embedding"
 OVERRIDE_KEY = f"megatron.{OP_NAME}"
@@ -141,13 +142,13 @@ def test_multi_modal_rotary_embedding(workload):
     assert actual.shape == (workload.length, workload.batch, 1, 2 * inv_freq.numel())
     assert actual.dtype == torch.float32
     assert actual.is_contiguous()
-    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
-    torch.testing.assert_close(position_ids, original_ids, rtol=0, atol=0)
-    torch.testing.assert_close(inv_freq, original_freqs, rtol=0, atol=0)
+    assert_close(actual, expected, expected.dtype)
+    assert_equal(position_ids, original_ids)
+    assert_equal(inv_freq, original_freqs)
     actual_storage = actual.untyped_storage().data_ptr()
     assert actual_storage != position_ids.untyped_storage().data_ptr()
     assert actual_storage != inv_freq.untyped_storage().data_ptr()
 
     if workload == WORKLOADS[0]:
         first_position = actual.new_tensor([1, 20, 300, 400, 1, 20, 300, 400])
-        torch.testing.assert_close(actual[0, 0, 0], first_position, rtol=0, atol=0)
+        assert_equal(actual[0, 0, 0], first_position)

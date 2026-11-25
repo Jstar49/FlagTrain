@@ -24,7 +24,7 @@ import torch
 
 import flag_train
 from flag_train.runtime import torch_backend_device
-from flag_train.testing import assert_close
+from flag_train.testing import assert_close, assert_equal
 
 OP_NAME = "router_gating_linear_function"
 WORKLOADS = (
@@ -158,13 +158,11 @@ def test_router_gating_linear_function(shape, num_experts, router_dtype, with_bi
     if router_dtype == torch.float32:
         _assert_fp32_reduction_close(actual, expected, inp.size(-1))
     else:
-        torch.testing.assert_close(actual, expected)
+        assert_close(actual, expected, expected.dtype)
     if with_bias:
-        torch.testing.assert_close(
-            actual.flatten()[0], expected.flatten()[0], rtol=0, atol=0
-        )
+        assert_equal(actual.flatten()[0], expected.flatten()[0])
     for actual_input, original in zip(candidate_inputs, inputs):
-        torch.testing.assert_close(actual_input, original, rtol=0, atol=0)
+        assert_equal(actual_input, original)
         assert (
             actual.untyped_storage().data_ptr()
             != actual_input.untyped_storage().data_ptr()
@@ -181,13 +179,14 @@ def test_router_gating_linear_function(shape, num_experts, router_dtype, with_bi
             actual_grads[1], expected_grads[1], grad_output.numel() // num_experts
         )
         if with_bias:
-            torch.testing.assert_close(
-                actual_grads[-1], expected_grads[-1], rtol=0, atol=0
-            )
+            assert_equal(actual_grads[-1], expected_grads[-1])
     else:
-        torch.testing.assert_close(actual_grads, expected_grads)
+        for actual_grad, expected_grad in zip(
+            actual_grads, expected_grads, strict=True
+        ):
+            assert_close(actual_grad, expected_grad, expected_grad.dtype)
     for actual_input, original in zip(candidate_inputs, inputs):
-        torch.testing.assert_close(actual_input, original, rtol=0, atol=0)
+        assert_equal(actual_input, original)
 
 
 @pytest.mark.router_gating_linear_function
@@ -203,17 +202,17 @@ def test_router_gating_linear_noncontiguous():
     reference_inputs = tuple(strided(tensor).requires_grad_() for tensor in originals)
     actual = flag_train.megatron.router_gating_linear_function(*candidate_inputs, dtype)
     expected = reference(*reference_inputs, dtype)
-    torch.testing.assert_close(actual, expected)
+    assert_close(actual, expected, expected.dtype)
     grad = torch.randn_like(expected)
     candidate_grad = strided(grad)
-    torch.testing.assert_close(
-        torch.autograd.grad(actual, candidate_inputs, candidate_grad),
-        torch.autograd.grad(expected, reference_inputs, strided(grad)),
-    )
+    actual_grads = torch.autograd.grad(actual, candidate_inputs, candidate_grad)
+    expected_grads = torch.autograd.grad(expected, reference_inputs, strided(grad))
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        assert_close(actual_grad, expected_grad, expected_grad.dtype)
     for actual_value, original_value in zip(
         (*candidate_inputs, candidate_grad), (*originals, grad)
     ):
-        torch.testing.assert_close(actual_value, original_value, rtol=0, atol=0)
+        assert_equal(actual_value, original_value)
 
 
 @pytest.mark.router_gating_linear_function
@@ -225,9 +224,13 @@ def test_router_gating_linear_empty_reduction_with_bias():
     actual = flag_train.megatron.router_gating_linear_function(
         inp, weight, bias, torch.float32
     )
-    torch.testing.assert_close(actual, bias.expand(2, 3))
+    assert_close(actual, bias.expand(2, 3), bias.dtype)
     grad = torch.tensor([[0.2, 0.4, 0.7], [0.15, 0.25, 0.35]], device=device)
-    torch.testing.assert_close(
-        torch.autograd.grad(actual, (inp, weight, bias), grad),
-        (torch.zeros_like(inp), torch.zeros_like(weight), grad.sum(0).half().float()),
+    actual_grads = torch.autograd.grad(actual, (inp, weight, bias), grad)
+    expected_grads = (
+        torch.zeros_like(inp),
+        torch.zeros_like(weight),
+        grad.sum(0).half().float(),
     )
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        assert_close(actual_grad, expected_grad, expected_grad.dtype)

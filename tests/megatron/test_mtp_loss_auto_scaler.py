@@ -23,6 +23,7 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_equal
 
 OP_NAME = "mtp_loss_auto_scaler"
 OVERRIDE_KEY = f"megatron.{OP_NAME}"
@@ -74,10 +75,10 @@ def _build_graph(fn, shape, dtype, initial_scale):
     original_loss = mtp_loss.detach().clone()
     result = fn(output, mtp_loss, scale)
     assert result.untyped_storage().data_ptr() == output.untyped_storage().data_ptr()
-    torch.testing.assert_close(result, original_output, rtol=0, atol=0)
-    torch.testing.assert_close(output, original_output, rtol=0, atol=0)
-    torch.testing.assert_close(mtp_loss, original_loss, rtol=0, atol=0)
-    torch.testing.assert_close(scale, scale.new_tensor(initial_scale), rtol=0, atol=0)
+    assert_equal(result, original_output)
+    assert_equal(output, original_output)
+    assert_equal(mtp_loss, original_loss)
+    assert_equal(scale, scale.new_tensor(initial_scale))
     upstream = torch.linspace(-2, 3, output.numel(), device=output.device)
     upstream = upstream.reshape(output.shape).to(output.dtype)
     return result, output, mtp_loss, scale, upstream
@@ -87,12 +88,10 @@ def _check_backward(graph, expected_scale):
     result, output, mtp_loss, scale, upstream = graph
     originals = tuple(tensor.detach().clone() for tensor in (output, mtp_loss, scale))
     grad_output, grad_loss = torch.autograd.grad(result, (output, mtp_loss), upstream)
-    torch.testing.assert_close(grad_output, upstream, rtol=0, atol=0)
-    torch.testing.assert_close(
-        grad_loss, mtp_loss.new_tensor(expected_scale), rtol=0, atol=0
-    )
+    assert_equal(grad_output, upstream)
+    assert_equal(grad_loss, mtp_loss.new_tensor(expected_scale))
     for tensor, original in zip((output, mtp_loss, scale), originals):
-        torch.testing.assert_close(tensor, original, rtol=0, atol=0)
+        assert_equal(tensor, original)
 
 
 @pytest.mark.mtp_loss_auto_scaler

@@ -17,6 +17,7 @@ import torch
 
 import flag_train
 from flag_train.reference_candidate import get_candidate
+from flag_train.testing import assert_close
 
 from .test_l2_normalization_backward import DTYPES, EPS, SHAPES
 
@@ -50,10 +51,10 @@ def test_l2_normalization(shape, eps, transpose, dtype):
     expected = reference(x_ref, eps)
     (expected_grad,) = torch.autograd.grad(expected, x_ref, grad)
     with torch.no_grad():
-        torch.testing.assert_close(candidate(x, eps), expected)
+        assert_close(candidate(x, eps), expected, expected.dtype)
 
     x.requires_grad_()
     actual = candidate(x, eps)
-    torch.testing.assert_close(actual, expected)
+    assert_close(actual, expected, expected.dtype)
     (actual_grad,) = torch.autograd.grad(actual, x, grad)
-    torch.testing.assert_close(actual_grad, expected_grad)
+    assert_close(actual_grad, expected_grad, expected_grad.dtype)
