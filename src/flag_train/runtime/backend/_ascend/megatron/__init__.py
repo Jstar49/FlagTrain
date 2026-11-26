@@ -40,6 +40,7 @@ from .scaled_upper_triang_masked_softmax_backward import (
 from .scaled_upper_triang_masked_softmax_forward import (
     scaled_upper_triang_masked_softmax_forward,
 )
+from .tanh_soft_clamp import tanh_soft_clamp
 from .weighted_squared_relu_impl import weighted_squared_relu_impl
 from .weighted_swiglu_funciton import weighted_swiglu_funciton
 
@@ -61,6 +62,7 @@ __all__ = [
     "scaled_masked_softmax_cuda_forward",
     "scaled_upper_triang_masked_softmax_backward",
     "scaled_upper_triang_masked_softmax_forward",
+    "tanh_soft_clamp",
     "weighted_squared_relu_impl",
     "weighted_swiglu_funciton",
 ]

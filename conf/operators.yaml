@@ -572,7 +572,9 @@ ops:
   stages:
   - beta: '0.0.0'
 - id: tanh_soft_clamp
-  description: 'Tanh Soft Clamp activation: scale * tanh(x / scale), computed in fp32.'
+  description: 'Tanh Soft Clamp activation: scale * tanh(x / scale), computed in fp32.
+    Supports real floating, integer, 8-bit unsigned and bool tensors on
+    accelerator or CPU.'
   for:
   - tanh_soft_clamp
   labels:
