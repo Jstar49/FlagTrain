@@ -75,10 +75,18 @@ def _ascend_project():
     )
 
 
+@lru_cache(maxsize=1)
+def _enflame_project():
+    return torch.compile(_project, backend="topsgraph", fullgraph=True, dynamic=False)
+
+
 def _run_compiled(input_logits, num_iterations, eps):
-    project = (
-        _ascend_project() if input_logits.device.type == "npu" else _compiled_project
-    )
+    if input_logits.device.type == "npu":
+        project = _ascend_project()
+    elif flag_train.vendor_name == "enflame":
+        project = _enflame_project()
+    else:
+        project = _compiled_project
     # Each workload may specialize both a no-grad and a grad-enabled graph.
     # Keep enough cached graphs for the suite, with no silent eager fallback.
     with dynamo_config.patch(recompile_limit=2 * len(CASES) * len(DTYPES)):
