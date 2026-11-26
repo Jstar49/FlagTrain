@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import numbers
 from functools import lru_cache
 
 import torch
@@ -32,42 +33,71 @@ _TILE_BYTES = 24 * 1024
 # Programs the grid should keep in flight when the token count allows it.
 _MIN_PROGRAMS = 32
 
-_INDEX_DTYPES = (torch.int32, torch.int64)
+# Indices are integer-like: the upstream kernel compiles for bool and the
+# signed integer widths, but not for unsigned or floating index tensors.
+_INDEX_DTYPES = (torch.bool, torch.int8, torch.int16, torch.int32, torch.int64)
 
-_PROBS_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+# Upstream stores the probabilities with no arithmetic, so it accepts every
+# real numeric dtype; floating, integer and bool tensors all work.
+_PROBS_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.uint8,
+    torch.uint16,
+    torch.uint32,
+    torch.uint64,
+    torch.bool,
+)
 
 
-# Elements the (ROWS, TOPK_BLOCK, EXPERTS_BLOCK) selection tile may hold.
-_TOP_K_TILE_ELEMS = 8192
+# The chunk loop fails to compile with an 8192-element tile on 910B; 4096
+# compiled for every measured expert/top-k combination.
+_PERSISTENT_TILE_ELEMS = 4096
 
 
-def _rows_per_prog(n_rows, topk_block, experts_block, elem_bytes, index_bytes):
-    """Rows one program carries, floored to a power of 2.
-
-    Bounded by the per-row byte budget, the minimum program count, and the
-    top-k-wide selection tile's element budget.
-    """
+def _rows_per_prog(n_rows, experts_block, elem_bytes, index_bytes):
+    """Rows per program, floored to a power of 2 from the byte budget and the
+    minimum program count; ``_persistent_rows`` caps it further."""
     per_row_bytes = experts_block * elem_bytes + 2 * index_bytes + elem_bytes
     rows = max(1, min(n_rows, _TILE_BYTES // per_row_bytes))
     rows = min(rows, max(1, n_rows // _MIN_PROGRAMS))
-    rows = min(rows, max(1, _TOP_K_TILE_ELEMS // (topk_block * experts_block)))
     return 1 << (rows.bit_length() - 1)
 
 
 @lru_cache(maxsize=64)
 def _launch_plan(num_tokens, num_experts, topk, elem_bytes, index_bytes):
-    """Block sizes and grid for one shape, cached because routing repeats it."""
+    """Block sizes for one shape, cached because routing repeats it."""
     experts_block = triton.next_power_of_2(num_experts)
     topk_block = triton.next_power_of_2(topk)
-    rows_per_prog = _rows_per_prog(
-        num_tokens, topk_block, experts_block, elem_bytes, index_bytes
-    )
-    return (
-        experts_block,
-        topk_block,
+    rows_per_prog = _rows_per_prog(num_tokens, experts_block, elem_bytes, index_bytes)
+    return experts_block, topk_block, rows_per_prog
+
+
+@lru_cache(maxsize=8)
+def _vector_core_count(device_index):
+    """Vector cores on ``device_index``, or None when the query is unavailable."""
+    try:
+        import triton.runtime.driver as driver
+
+        props = driver.active.utils.get_device_properties(device_index)
+        return int(props["num_vectorcore"])
+    except Exception:
+        return None
+
+
+def _persistent_rows(rows_per_prog, topk_block, experts_block):
+    """Rows per chunk for the persistent kernel, floored to a power of 2."""
+    rows = min(
         rows_per_prog,
-        (triton.cdiv(num_tokens, rows_per_prog),),
+        max(1, _PERSISTENT_TILE_ELEMS // (topk_block * experts_block)),
     )
+    return 1 << (rows.bit_length() - 1)
 
 
 def _check_input(tensor, name, dtypes):
@@ -82,9 +112,79 @@ def _check_input(tensor, name, dtypes):
         )
 
 
+@triton.jit
+def _multihot_rows(
+    indices_ptr,
+    probs_ptr,
+    multihot_ptr,
+    multihot_probs_ptr,
+    row,
+    num_tokens,
+    NUM_EXPERTS: tl.constexpr,
+    TOPK: tl.constexpr,
+    TOPK_BLOCK: tl.constexpr,
+    EXPERTS_BLOCK: tl.constexpr,
+    PACKED: tl.constexpr,
+):
+    """Write the multihot map and per-expert probabilities of ``row`` tokens.
+
+    One (ROWS, TOPK_BLOCK, EXPERTS_BLOCK) tile is compared and reduced along
+    top-k, so every output element is written exactly once.
+    """
+    row_mask = row < num_tokens
+
+    expert_col = tl.arange(0, EXPERTS_BLOCK)
+    expert_mask = expert_col < NUM_EXPERTS
+
+    probs_dtype = multihot_probs_ptr.dtype.element_ty
+    topk_col = tl.arange(0, TOPK_BLOCK)
+    in_off = row[:, None] * TOPK + topk_col[None, :]
+    in_mask = row_mask[:, None] & (topk_col[None, :] < TOPK)
+    # ``other=-1`` fits every accepted index width; NUM_EXPERTS would not fit
+    # an int8/int16 tensor that spans a wider expert count.
+    indices = tl.load(indices_ptr + in_off, mask=in_mask, other=-1)
+    # A plain integer zero keeps this load dtype-generic for integer and bool
+    # probability tensors.
+    probs = tl.load(probs_ptr + in_off, mask=in_mask, other=0)
+    # -1, out-of-range ids and padding lanes map to the never-matching column
+    # NUM_EXPERTS; fp32 compares avoid the scalar int64 path.
+    indices_f = indices.to(tl.float32)
+    in_range = (
+        (indices_f >= 0.0)
+        & (indices_f < NUM_EXPERTS * 1.0)
+        & (topk_col[None, :] < TOPK)
+    )
+    indices = tl.where(in_range, indices.to(tl.int32), NUM_EXPERTS)
+
+    selected = indices[:, :, None] == expert_col[None, None, :]
+
+    # Duplicate ids: upstream's scatter race keeps the earliest lane on
+    # NVIDIA, so select that lane explicitly rather than summing.
+    lane = tl.arange(0, TOPK_BLOCK)
+    if PACKED:
+        # ``lane << 16 | prob bits``: one min reduction yields both the first
+        # lane and its probability, for 16-bit probabilities only.
+        sentinel = TOPK_BLOCK << 16
+        prob_bits = probs.to(tl.uint16, bitcast=True).to(tl.int32)
+        packed = (lane[None, :, None] << 16) | prob_bits[:, :, None]
+        first = tl.min(tl.where(selected, packed, sentinel), axis=1)
+        hit = first < sentinel
+        probs_out = (first & 0xFFFF).to(tl.uint16).to(probs_dtype, bitcast=True)
+    else:
+        first_pos = tl.min(tl.where(selected, lane[None, :, None], TOPK_BLOCK), axis=1)
+        keep = selected & (lane[None, :, None] == first_pos[:, None, :])
+        hit = first_pos < TOPK_BLOCK
+        probs_out = tl.sum(tl.where(keep, probs[:, :, None], 0), axis=1)
+
+    out_off = row[:, None] * NUM_EXPERTS + expert_col[None, :]
+    out_mask = row_mask[:, None] & expert_mask[None, :]
+    tl.store(multihot_ptr + out_off, hit.to(tl.int1), mask=out_mask)
+    tl.store(multihot_probs_ptr + out_off, probs_out.to(probs_dtype), mask=out_mask)
+
+
 @libentry()
 @triton.jit
-def _indices_to_multihot_kernel(
+def _indices_to_multihot_persistent_kernel(
     indices_ptr,
     probs_ptr,
     multihot_ptr,
@@ -95,40 +195,66 @@ def _indices_to_multihot_kernel(
     TOPK_BLOCK: tl.constexpr,
     EXPERTS_BLOCK: tl.constexpr,
     ROWS: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
-    """Turn ``ROWS`` tokens' top-k expert ids into ``num_experts``-wide rows.
+    """Run a grid-stride loop over the token-row chunks.
 
-    One (ROWS, TOPK_BLOCK, EXPERTS_BLOCK) tile is compared against the expert
-    rows and reduced along top-k, so every output element is written once
-    without the overlapping zero-then-scatter stores.
+    The host caps the grid at the vector-core count, so the program count never
+    exceeds what the device can run at once and the launch stays well below the
+    launcher's 65535 coreDim limit.
     """
-    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-    row_mask = row < num_tokens
+    pid = tl.program_id(0)
+    num_progs = tl.num_programs(0)
+    num_chunks = tl.cdiv(num_tokens, ROWS)
+    rows_base = tl.arange(0, ROWS)
+    for chunk in range(pid, num_chunks, num_progs):
+        row = chunk * ROWS + rows_base
+        _multihot_rows(
+            indices_ptr,
+            probs_ptr,
+            multihot_ptr,
+            multihot_probs_ptr,
+            row,
+            num_tokens,
+            NUM_EXPERTS,
+            TOPK,
+            TOPK_BLOCK,
+            EXPERTS_BLOCK,
+            PACKED,
+        )
 
-    expert_col = tl.arange(0, EXPERTS_BLOCK)
-    expert_mask = expert_col < NUM_EXPERTS
 
-    probs_dtype = multihot_probs_ptr.dtype.element_ty
-    topk_col = tl.arange(0, TOPK_BLOCK)
-    in_off = row[:, None] * TOPK + topk_col[None, :]
-    in_mask = row_mask[:, None] & (topk_col[None, :] < TOPK)
-    indices = tl.load(indices_ptr + in_off, mask=in_mask, other=NUM_EXPERTS)
-    probs = tl.load(probs_ptr + in_off, mask=in_mask, other=0.0)
-    # -1 (Megatron's padding) and other out-of-range ids map to the
-    # never-matching column NUM_EXPERTS. fp32 compares avoid this backend's
-    # scalar int64 path and stay exact below 2**24, INT64_MIN included.
-    indices_f = indices.to(tl.float32)
-    in_range = (indices_f >= 0.0) & (indices_f < NUM_EXPERTS * 1.0)
-    indices = tl.where(in_range, indices.to(tl.int32), NUM_EXPERTS)
-
-    selected = indices[:, :, None] == expert_col[None, None, :]
-    hit = tl.sum(selected.to(tl.int32), axis=1) > 0
-    probs_out = tl.sum(tl.where(selected, probs[:, :, None], 0.0), axis=1)
-
-    out_off = row[:, None] * NUM_EXPERTS + expert_col[None, :]
-    out_mask = row_mask[:, None] & expert_mask[None, :]
-    tl.store(multihot_ptr + out_off, hit.to(tl.int1), mask=out_mask)
-    tl.store(multihot_probs_ptr + out_off, probs_out.to(probs_dtype), mask=out_mask)
+def _launch_persistent(
+    indices,
+    probs,
+    multihot,
+    multihot_probs,
+    num_tokens,
+    num_of_local_experts,
+    topk,
+    experts_block,
+    topk_block,
+    rows_per_prog,
+    packed,
+    num_progs,
+):
+    """Launch at most one program per vector core; each strides over chunks."""
+    _indices_to_multihot_persistent_kernel[(num_progs,)](
+        indices,
+        probs,
+        multihot,
+        multihot_probs,
+        num_tokens,
+        NUM_EXPERTS=num_of_local_experts,
+        TOPK=topk,
+        TOPK_BLOCK=topk_block,
+        EXPERTS_BLOCK=experts_block,
+        ROWS=rows_per_prog,
+        PACKED=packed,
+        num_warps=_NUM_WARPS,
+        # The chunk loop only compiles with multi-buffer off on 910B.
+        multibuffer=False,
+    )
 
 
 def _indices_to_multihot_forward(indices, probs, num_of_local_experts):
@@ -144,26 +270,37 @@ def _indices_to_multihot_forward(indices, probs, num_of_local_experts):
     )
 
     if num_tokens > 0 and topk > 0 and num_of_local_experts > 0:
-        experts_block, topk_block, rows_per_prog, grid = _launch_plan(
+        experts_block, topk_block, rows_per_prog = _launch_plan(
             num_tokens,
             num_of_local_experts,
             topk,
             probs.element_size(),
             indices.element_size(),
         )
+        # Packing (lane, probability) into one int32 needs 16-bit
+        # probabilities; it also loses to the plain branch for narrow top-k.
+        packed = topk_block >= 8 and probs.dtype in (torch.float16, torch.bfloat16)
         with torch_device_fn.device(device):
-            _indices_to_multihot_kernel[grid](
+            # Cap the grid at the vector-core count and let each program stride
+            # over the remaining chunks. A single program is the always-legal
+            # fallback when the core-count query is unavailable.
+            rows = _persistent_rows(rows_per_prog, topk_block, experts_block)
+            chunks = triton.cdiv(num_tokens, rows)
+            cores = _vector_core_count(torch_device_fn.current_device())
+            num_progs = min(chunks, cores or 1)
+            _launch_persistent(
                 indices,
                 probs,
                 multihot,
                 multihot_probs,
                 num_tokens,
-                NUM_EXPERTS=num_of_local_experts,
-                TOPK=topk,
-                TOPK_BLOCK=topk_block,
-                EXPERTS_BLOCK=experts_block,
-                ROWS=rows_per_prog,
-                num_warps=_NUM_WARPS,
+                num_of_local_experts,
+                topk,
+                experts_block,
+                topk_block,
+                rows,
+                packed,
+                num_progs,
             )
     elif num_tokens > 0 and topk == 0 and num_of_local_experts > 0:
         # Nothing to scatter, but every expert column is still unselected.
@@ -179,12 +316,16 @@ def fused_indices_to_multihot(indices, probs_indices, num_of_local_experts):
     Each row of ``indices`` marks its ``topk`` experts in a
     ``num_of_local_experts``-wide row and puts each probability in its expert's
     column. ``-1`` padding and indices outside ``[0, num_of_local_experts)`` are
-    ignored. Forward-only: neither result carries a gradient.
+    ignored. If a row repeats an expert, the first occurrence's probability
+    wins -- upstream leaves that ordering to a scatter race, which keeps the
+    first lane on NVIDIA. Forward-only: neither result carries a gradient.
 
     Args:
-        indices (Tensor): int32 / int64 device tensor of shape ``(tokens, topk)``.
-        probs_indices (Tensor): fp16 / bf16 / fp32 / fp64 tensor of the same
-            shape, holding the routing probability of each index.
+        indices (Tensor): bool / int8 / int16 / int32 / int64 device tensor of
+            shape ``(tokens, topk)``.
+        probs_indices (Tensor): floating (fp16 / bf16 / fp32 / fp64), integer
+            or bool tensor of the same shape, holding the routing probability
+            of each index.
         num_of_local_experts (int): width of the expert map.
 
     Returns:
@@ -214,14 +355,20 @@ def fused_indices_to_multihot(indices, probs_indices, num_of_local_experts):
             "fused_indices_to_multihot needs both tensors on the same device, got "
             f"{indices.device} and {probs_indices.device}"
         )
-    if not isinstance(num_of_local_experts, int) or num_of_local_experts < 0:
+    # Upstream passes the width to Triton as a constexpr, so Python and numpy
+    # integer scalars work but a tensor does not. Match that acceptance set.
+    if (
+        not isinstance(num_of_local_experts, numbers.Integral)
+        or num_of_local_experts < 0
+    ):
         raise ValueError(
             "fused_indices_to_multihot needs a non-negative integer "
             f"num_of_local_experts, got {num_of_local_experts!r}"
         )
+    width = int(num_of_local_experts)
 
     # Row addressing assumes contiguous strides.
     indices = indices.contiguous()
     probs_indices = probs_indices.contiguous()
 
-    return _indices_to_multihot_forward(indices, probs_indices, num_of_local_experts)
+    return _indices_to_multihot_forward(indices, probs_indices, width)

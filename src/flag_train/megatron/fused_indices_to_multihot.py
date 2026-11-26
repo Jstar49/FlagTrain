@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import numbers
 from functools import lru_cache
 
 import torch
@@ -26,9 +27,27 @@ logger = logging.getLogger(__name__)
 
 _NUM_WARPS = 1
 
-_INDEX_DTYPES = (torch.int32, torch.int64)
+# Indices are integer-like: the upstream kernel compiles for bool and the
+# signed integer widths, but not for unsigned or floating index tensors.
+_INDEX_DTYPES = (torch.bool, torch.int8, torch.int16, torch.int32, torch.int64)
 
-_PROBS_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+# Upstream stores the probabilities with no arithmetic, so it accepts every
+# real numeric dtype; floating, integer and bool tensors all work.
+_PROBS_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.uint8,
+    torch.uint16,
+    torch.uint32,
+    torch.uint64,
+    torch.bool,
+)
 
 
 def _tile_elements(experts_block, topk):
@@ -111,17 +130,29 @@ def _indices_to_multihot_kernel(
     in_off = row[:, None] * TOPK + topk_col[None, :]
     in_mask = row_mask[:, None] & topk_mask[None, :]
     indices = tl.load(indices_ptr + in_off, mask=in_mask, other=-1)
-    probs = tl.load(probs_ptr + in_off, mask=in_mask, other=0.0)
+    # A plain integer zero keeps this load dtype-generic for integer and bool
+    # probability tensors.
+    probs = tl.load(probs_ptr + in_off, mask=in_mask, other=0)
 
     # -1 (Megatron's padding) and anything else outside [0, NUM_EXPERTS) is
     # ignored. Check before narrowing: INT64_MIN would narrow to column 0.
     valid = in_mask & (indices >= 0) & (indices < NUM_EXPERTS)
+
+    # A row may name the same expert twice. Upstream lets the scatter race
+    # decide; on NVIDIA the earliest top-k lane wins, so mask the later copies
+    # and keep the first occurrence deterministically, matching that result.
+    lane = tl.arange(0, TOPK_BLOCK)
+    repeat = indices[:, :, None] == indices[:, None, :]
+    earlier_lane = lane[None, None, :] < lane[None, :, None]
+    duplicate = tl.max((repeat & earlier_lane).to(tl.int32), axis=2) > 0
+    valid = valid & ~duplicate
+
     indices = indices.to(tl.int32)
 
     out_off = row[:, None] * NUM_EXPERTS + expert_col[None, :]
     out_mask = row_mask[:, None] & expert_mask[None, :]
     tl.store(multihot_ptr + out_off, 0, mask=out_mask)
-    tl.store(multihot_probs_ptr + out_off, 0.0, mask=out_mask)
+    tl.store(multihot_probs_ptr + out_off, 0, mask=out_mask)
 
     tl.debug_barrier()
 
@@ -174,12 +205,16 @@ def fused_indices_to_multihot(indices, probs_indices, num_of_local_experts):
     Each row of ``indices`` marks its ``topk`` experts in a
     ``num_of_local_experts``-wide row and puts each probability in its expert's
     column. ``-1`` padding and indices outside ``[0, num_of_local_experts)`` are
-    ignored. Forward-only: neither result carries a gradient.
+    ignored. If a row repeats an expert, the first occurrence's probability
+    wins -- upstream leaves that ordering to a scatter race, which keeps the
+    first lane on NVIDIA. Forward-only: neither result carries a gradient.
 
     Args:
-        indices (Tensor): int32 / int64 device tensor of shape ``(tokens, topk)``.
-        probs_indices (Tensor): fp16 / bf16 / fp32 / fp64 tensor of the same
-            shape, holding the routing probability of each index.
+        indices (Tensor): bool / int8 / int16 / int32 / int64 device tensor of
+            shape ``(tokens, topk)``.
+        probs_indices (Tensor): floating (fp16 / bf16 / fp32 / fp64), integer
+            or bool tensor of the same shape, holding the routing probability
+            of each index.
         num_of_local_experts (int): width of the expert map.
 
     Returns:
@@ -209,14 +244,20 @@ def fused_indices_to_multihot(indices, probs_indices, num_of_local_experts):
             "fused_indices_to_multihot needs both tensors on the same device, got "
             f"{indices.device} and {probs_indices.device}"
         )
-    if not isinstance(num_of_local_experts, int) or num_of_local_experts < 0:
+    # Upstream passes the width to Triton as a constexpr, so Python and numpy
+    # integer scalars work but a tensor does not. Match that acceptance set.
+    if (
+        not isinstance(num_of_local_experts, numbers.Integral)
+        or num_of_local_experts < 0
+    ):
         raise ValueError(
             "fused_indices_to_multihot needs a non-negative integer "
             f"num_of_local_experts, got {num_of_local_experts!r}"
         )
+    width = int(num_of_local_experts)
 
     # Row addressing assumes contiguous strides.
     indices = indices.contiguous()
     probs_indices = probs_indices.contiguous()
 
-    return _indices_to_multihot_forward(indices, probs_indices, num_of_local_experts)
+    return _indices_to_multihot_forward(indices, probs_indices, width)
