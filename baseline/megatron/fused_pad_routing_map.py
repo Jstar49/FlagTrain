@@ -25,14 +25,14 @@ from ``FlagTrain/benchmark/megatron/test_fused_pad_routing_map.py``. Each shape
 is a deployment or synthetic boundary case
 ``(num_tokens, num_experts, top_k, pad_multiple)``.
 
-Megatron decorates the function with ``@jit_fuser`` (``torch.compile``). Like
-``quick_gelu.py`` this module disables the fuser and unwraps the original
-callable, so NCU profiles Megatron's own Triton kernel and the ATen
-transpose/cast rather than Inductor output. Megatron is imported lazily on the
-first ``native()`` call, so ops discovery does not trigger it.
+Megatron decorates the function with ``@jit_fuser`` (``torch.compile``). This
+module keeps the decorated function, matching Megatron's default execution.
+Megatron is imported lazily on the first ``native()`` call, so ops discovery
+does not trigger it.
 """
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "fused_pad_routing_map"
 DTYPES = [torch.bool, torch.int32]
@@ -65,10 +65,6 @@ def _megatron_fused_pad_routing_map():
     global _MEGATRON_FUSED_PAD_ROUTING_MAP
     if _MEGATRON_FUSED_PAD_ROUTING_MAP is None:
         try:
-            import megatron.core.jit as megatron_jit
-
-            # The collector profiles native kernels, not Inductor output.
-            megatron_jit.disable_jit_fuser()
             from megatron.core.fusions.fused_pad_routing_map import (
                 fused_pad_routing_map,
             )
@@ -79,12 +75,7 @@ def _megatron_fused_pad_routing_map():
                 ".fused_pad_routing_map, which could not be imported: "
                 f"{exc!r}. Install megatron-core on this machine."
             ) from exc
-        # megatron.core's package __init__ imports the fusions module before
-        # disable_jit_fuser() can run, so the decorator may already have wrapped
-        # the function with torch.compile; unwrap the original callable.
-        _MEGATRON_FUSED_PAD_ROUTING_MAP = getattr(
-            fused_pad_routing_map, "_torchdynamo_orig_callable", fused_pad_routing_map
-        )
+        _MEGATRON_FUSED_PAD_ROUTING_MAP = fused_pad_routing_map
     return _MEGATRON_FUSED_PAD_ROUTING_MAP
 
 
@@ -117,7 +108,14 @@ def _make_routing_map(num_tokens, num_experts, top_k, dtype, device):
 def build_inputs(binding, dtype, device):
     num_tokens, num_experts, top_k, pad_multiple = binding["shape"]
     routing_map = _make_routing_map(num_tokens, num_experts, top_k, dtype, device)
-    return (routing_map, pad_multiple), {}
+    args = (routing_map, pad_multiple)
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        native()(*args)
+    return args, {}
 
 
 def key_shape(binding):

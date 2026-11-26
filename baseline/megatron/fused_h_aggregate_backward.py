@@ -25,13 +25,8 @@ composition.
 Shapes, dtypes and input construction are copied from
 ``FlagTrain/benchmark/megatron/test_fused_h_aggregate_backward.py``.
 
-``native_h_aggregate`` carries ``@torch.compile`` upstream. The collector
-profiles native kernels rather than Inductor output, so the decorator is
-unwrapped back to the eager function (``_torchdynamo_orig_callable``) -- the
-same body the benchmark's correctness suite compares against. The benchmark
-keeps the compile because that is what Megatron pays; this module measures the
-eager derivative underneath it, like ``quick_gelu.py`` and
-``fused_pad_routing_map.py``.
+``native_h_aggregate`` carries ``@torch.compile`` upstream. The collector keeps
+that compiled callable, matching what Megatron pays by default.
 
 Only the backward is timed: the forward graph is built outside the profiled
 region, as the benchmark's baseline does, because the operator under test takes
@@ -43,6 +38,14 @@ than being replaced by a transcription.
 """
 
 import torch
+import torch._functorch.config
+from torch._dynamo import config as dynamo_config
+
+# The collector re-runs the same backward graph for every timed repetition
+# (retain_graph=True). Compiled AOTAutograd backward donates its saved buffers
+# by default and then refuses retain_graph=True, so disable donation here, as
+# the benchmark does.
+torch._functorch.config.donated_buffer = False
 
 # The collector profiles the backward under an NVTX range, but
 # torch.autograd.grad runs its backward kernels on autograd worker threads,
@@ -78,7 +81,7 @@ _GRAPH = None
 
 
 def _megatron_native_h_aggregate():
-    """Megatron-LM's eager ``native_h_aggregate``; raise when unavailable."""
+    """Megatron-LM's ``native_h_aggregate``; raise when unavailable."""
     global _MEGATRON_NATIVE_H_AGGREGATE
     if _MEGATRON_NATIVE_H_AGGREGATE is None:
         try:
@@ -91,12 +94,7 @@ def _megatron_native_h_aggregate():
                 f"{exc!r}. Install megatron-core from its main branch on this "
                 "machine."
             ) from exc
-        # Upstream decorates the function with @torch.compile directly, so
-        # disable_jit_fuser() cannot help; unwrap the original eager callable
-        # the collector should profile instead of Inductor output.
-        _MEGATRON_NATIVE_H_AGGREGATE = getattr(
-            native_h_aggregate, "_torchdynamo_orig_callable", native_h_aggregate
-        )
+        _MEGATRON_NATIVE_H_AGGREGATE = native_h_aggregate
     return _MEGATRON_NATIVE_H_AGGREGATE
 
 
@@ -151,7 +149,14 @@ def build_inputs(binding, dtype, device):
     h_pre = torch.randn((s, b, n), dtype=dtype, device=device)
     # Forward graph, outside the profiled region.
     _build_graph(x, h_pre)
-    return (grad_output, x, h_pre), {}
+    args = (grad_output, x, h_pre)
+    # Compile this shape/dtype (forward and backward) before timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        torch_op(*args)
+    return args, {}
 
 
 def key_shape(binding):

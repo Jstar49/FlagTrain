@@ -32,12 +32,8 @@ operator's saved scale ``r`` comes from the reference forward; the baseline's
 own graph recomputes its scale from ``x``, exactly as the benchmark's baseline
 does.
 
-``native_proj_rms`` carries ``@torch.compile`` upstream. The collector profiles
-native kernels rather than Inductor output, so the decorator is unwrapped back
-to the eager function (``_torchdynamo_orig_callable``) and the eager autograd
-derivative is measured. The benchmark keeps the compile (with buffer donation
-off, so the graph can be re-run) because that is what Megatron pays; the eager
-derivative is measurably slower, so this record is the conservative one.
+``native_proj_rms`` carries ``@torch.compile`` upstream. The collector keeps
+that compiled callable, matching what Megatron pays by default.
 
 ``native_proj_rms`` arrived with the mHC proj_rms stage in megatron-core 0.20;
 an older install has no ``hyper_connection`` module and is reported as such
@@ -47,6 +43,14 @@ rather than being replaced by a transcription.
 import math
 
 import torch
+import torch._functorch.config
+from torch._dynamo import config as dynamo_config
+
+# The collector re-runs the same backward graph for every timed repetition
+# (retain_graph=True). Compiled AOTAutograd backward donates its saved buffers
+# by default and then refuses retain_graph=True, so disable donation here, as
+# the benchmark does.
+torch._functorch.config.donated_buffer = False
 
 # The collector profiles the backward under an NVTX range, but
 # torch.autograd.grad runs its backward kernels on autograd worker threads,
@@ -84,7 +88,7 @@ _GRAPH = None
 
 
 def _megatron_native_proj_rms():
-    """Megatron-LM's eager ``native_proj_rms``; raise when it is unavailable."""
+    """Megatron-LM's ``native_proj_rms``; raise when it is unavailable."""
     global _MEGATRON_NATIVE_PROJ_RMS
     if _MEGATRON_NATIVE_PROJ_RMS is None:
         try:
@@ -97,12 +101,7 @@ def _megatron_native_proj_rms():
                 f"{exc!r}. Install megatron-core from its main branch on this "
                 "machine."
             ) from exc
-        # Upstream decorates the function with @torch.compile directly, so
-        # disable_jit_fuser() cannot help; unwrap the original eager callable
-        # the collector should profile instead of Inductor output.
-        _MEGATRON_NATIVE_PROJ_RMS = getattr(
-            native_proj_rms, "_torchdynamo_orig_callable", native_proj_rms
-        )
+        _MEGATRON_NATIVE_PROJ_RMS = native_proj_rms
     return _MEGATRON_NATIVE_PROJ_RMS
 
 
@@ -168,7 +167,14 @@ def build_inputs(binding, dtype, device):
     grad_r = torch.randn((M, 1), dtype=dtype, device=device)
     # Forward graph and saved scale, both outside the timed/profiled region.
     r = _build_graph(x, weight)["r"]
-    return (x, weight, grad_proj, grad_r, r), {}
+    args = (x, weight, grad_proj, grad_r, r)
+    # Compile this shape/dtype (forward and backward) before timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        torch_op(*args)
+    return args, {}
 
 
 def key_shape(binding):

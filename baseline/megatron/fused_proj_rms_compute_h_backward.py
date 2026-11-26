@@ -31,13 +31,20 @@ before the profiled call, also keeps the forward kernels out of the NVTX
 range.
 
 Megatron 0.21 wraps the torch path of this forward in ``@torch.compile``. The
-graph is built with Dynamo disabled, so the collector profiles the eager ATen
-backward kernels rather than Inductor output; on a cuTile-capable install the
-public forward dispatches to the cuTile kernel and its fused backward is what
-``autograd.grad`` runs.
+graph is built with that default, so the collector profiles Inductor's fused
+kernels; on a cuTile-capable install the public forward dispatches to the
+cuTile kernel and its fused backward is what ``autograd.grad`` runs.
 """
 
 import torch
+import torch._functorch.config
+from torch._dynamo import config as dynamo_config
+
+# The collector re-runs the same backward graph for every timed repetition
+# (retain_graph=True). Compiled AOTAutograd backward donates its saved buffers
+# by default and then refuses retain_graph=True, so disable donation here, as
+# the benchmark does.
+torch._functorch.config.donated_buffer = False
 
 # The collector profiles the backward under an NVTX range, but
 # torch.autograd.grad runs its backward kernels on autograd worker threads,
@@ -102,18 +109,15 @@ def _build_graph(x, weight, alpha_pre, alpha_post, alpha_res, bias, n):
     alpha_res_leaf = alpha_res.detach().clone().requires_grad_(True)
     bias_leaf = bias.detach().clone().requires_grad_(True)
 
-    import torch._dynamo
-
-    with torch._dynamo.config.patch(disable=True):
-        h_pre, h_post, h_res, r = _megatron_forward()(
-            x_leaf,
-            weight_leaf,
-            alpha_pre_leaf,
-            alpha_post_leaf,
-            alpha_res_leaf,
-            bias_leaf,
-            n,
-        )
+    h_pre, h_post, h_res, r = _megatron_forward()(
+        x_leaf,
+        weight_leaf,
+        alpha_pre_leaf,
+        alpha_post_leaf,
+        alpha_res_leaf,
+        bias_leaf,
+        n,
+    )
     _GRAPH = {
         "x": x,
         "weight": weight,
@@ -244,6 +248,12 @@ def build_inputs(binding, dtype, device):
         bias,
         n,
     )
+    # Compile this shape/dtype (forward and backward) before timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        torch_op(*args)
     return args, {}
 
 

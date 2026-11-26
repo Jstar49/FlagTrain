@@ -15,10 +15,10 @@
 """NVIDIA baseline for quick_gelu (forward).
 
 Self-contained module; depends only on torch and megatron. ``native()`` returns
-Megatron-LM's eager ``megatron.core.activations.quick_gelu`` (Megatron's
-``jit_fuser``, i.e. ``torch.compile``, is disabled so the collector profiles
-ATen kernels rather than Inductor output); when Megatron is unavailable it
-raises instead of collecting a baseline or falling back to a torch composition.
+Megatron-LM's ``megatron.core.activations.quick_gelu`` as Megatron runs it
+by default (``jit_fuser`` is ``torch.compile`` on supported PyTorch versions);
+when Megatron is unavailable it raises instead of collecting a baseline or
+falling back to a torch composition.
 Shapes and dtypes are copied from
 ``FlagTrain/benchmark/megatron/test_quick_gelu.py``.
 """
@@ -26,6 +26,7 @@ Shapes and dtypes are copied from
 import math
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "quick_gelu"
 DTYPES = [torch.float16, torch.float32, torch.bfloat16]
@@ -44,20 +45,11 @@ _SHAPES = [
 
 
 def base_op():
-    """Megatron-LM quick_gelu (eager); raises when Megatron is unavailable."""
+    """Megatron-LM quick_gelu; raises when Megatron is unavailable."""
     try:
-        import megatron.core.jit as megatron_jit
-
-        # Megatron's @jit_fuser is torch.compile by default. The collector must
-        # profile Megatron's eager kernels rather than Inductor output, so
-        # disable the fuser before activations binds the decorator.
-        megatron_jit.disable_jit_fuser()
         import megatron.core.activations
 
-        kernel = megatron.core.activations.quick_gelu
-        # activations may have been imported before the fuser was disabled; in
-        # that case unwrap the torch.compile wrapper instead of compiling here.
-        return getattr(kernel, "_torchdynamo_orig_callable", kernel)
+        return megatron.core.activations.quick_gelu
     except Exception as exc:
         raise RuntimeError(
             "quick_gelu baseline requires Megatron-LM's "
@@ -75,7 +67,14 @@ def grid():
 
 
 def build_inputs(binding, dtype, device):
-    return (torch.randn(binding["shape"], dtype=dtype, device=device),), {}
+    args = (torch.randn(binding["shape"], dtype=dtype, device=device),)
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        native()(*args)
+    return args, {}
 
 
 def key_shape(binding):

@@ -17,7 +17,8 @@
 Self-contained module; depends only on torch and megatron. ``native()`` returns
 Megatron-LM's ``megatron.core.fusions.fused_mhc_kernels.fused_proj_rms_compute_h``
 (the public forward: it dispatches to the cuTile kernel when available and
-otherwise runs ``_torch_proj_rms_compute_h``); when Megatron is unavailable --
+otherwise runs ``_torch_proj_rms_compute_h``, which Megatron compiles with
+``@torch.compile`` on supported versions); when Megatron is unavailable --
 or the installed release predates the mHC kernels, which megatron-core 0.19.2
 does not ship -- it raises instead of collecting a baseline or falling back to
 a torch composition.
@@ -33,6 +34,7 @@ real configuration, low-precision activations with the mapping parameters
 """
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "fused_proj_rms_compute_h_forward"
 # benchmark/megatron/test_fused_proj_rms_compute_h_forward.py::_ACTIVATION_DTYPES
@@ -71,16 +73,7 @@ def base_op():
             "module (megatron-core 0.19.2 does not)."
         ) from exc
 
-    def eager_forward(*args, **kwargs):
-        # Megatron 0.21 wraps its torch path in @torch.compile. The collector
-        # profiles ATen kernels, not Inductor output (same rule as the
-        # quick_gelu baseline's disable_jit_fuser), so run it eagerly.
-        import torch._dynamo
-
-        with torch._dynamo.config.patch(disable=True):
-            return kernel(*args, **kwargs)
-
-    return eager_forward
+    return kernel
 
 
 def native():
@@ -103,6 +96,12 @@ def build_inputs(binding, dtype, device):
     # The operator defaults eps and compute_h_eps to 1e-6; the baseline calls
     # the upstream forward with the same defaults.
     args = (x, weight, alpha, alpha, alpha, bias, n)
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        native()(*args)
     return args, {}
 
 

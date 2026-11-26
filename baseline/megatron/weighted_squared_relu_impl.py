@@ -23,14 +23,15 @@ they share one ``OP_NAME`` and are told apart by a suffix on the shape key (as
 ``fused_gated_norm`` does). Shapes, dtypes, the clamp scale and the inputs are
 copied from ``benchmark/megatron/test_weighted_squared_relu_impl.py``.
 
-Megatron's ``@jit_fuser`` wrappers are unwrapped in place, so NCU profiles the
-eager baseline rather than Inductor kernels. Megatron is imported lazily on the
-first ``native()`` call, so ops discovery does not trigger it.
+Megatron's ``@jit_fuser`` wrappers are left compiled, so the baseline records
+Megatron's default Inductor kernels. Megatron is imported lazily on the first
+``native()`` call, so ops discovery does not trigger it.
 """
 
 import math
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "weighted_squared_relu_impl"
 DTYPES = [torch.float16, torch.float32, torch.bfloat16]
@@ -69,10 +70,6 @@ def _megatron_weighted_squared_relu_impl():
     global _MEGATRON_WEIGHTED_SQUARED_RELU_IMPL
     if _MEGATRON_WEIGHTED_SQUARED_RELU_IMPL is None:
         try:
-            import megatron.core.jit as megatron_jit
-
-            # The collector profiles eager kernels, not Inductor output.
-            megatron_jit.disable_jit_fuser()
             import megatron.core.fusions.fused_weighted_squared_relu as module
         except Exception as exc:
             raise RuntimeError(
@@ -81,16 +78,6 @@ def _megatron_weighted_squared_relu_impl():
                 ".weighted_squared_relu_impl, which could not be imported: "
                 f"{exc!r}. Install megatron-core on this machine."
             ) from exc
-        # megatron.core imports this module before disable_jit_fuser() can run,
-        # so unwrap the compiled functions the public *_impl reads from globals.
-        for name in (
-            "_tanh_relu_over_scale",
-            "weighted_squared_relu",
-            "clamped_squared_relu",
-            "weighted_clamped_squared_relu",
-        ):
-            kernel = getattr(module, name)
-            setattr(module, name, getattr(kernel, "_torchdynamo_orig_callable", kernel))
         _MEGATRON_WEIGHTED_SQUARED_RELU_IMPL = module.weighted_squared_relu_impl
     return _MEGATRON_WEIGHTED_SQUARED_RELU_IMPL
 
@@ -137,6 +124,12 @@ def _make_operands(shape, dtype, device, variant):
 
 def build_inputs(binding, dtype, device):
     args = _make_operands(binding["shape"], dtype, device, binding["variant"])
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        torch_op(*args)
     return args, {}
 
 

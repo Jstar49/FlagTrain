@@ -24,13 +24,8 @@ instead of falling back to a torch composition.
 Shapes, dtypes and input construction are copied from
 ``FlagTrain/benchmark/megatron/test_fused_proj_rms_forward.py``.
 
-``native_proj_rms`` carries ``@torch.compile`` upstream. The collector profiles
-native kernels rather than Inductor output, so the decorator is unwrapped back
-to the eager function (``_torchdynamo_orig_callable``) -- the same body the
-benchmark's correctness suite compares against. The benchmark keeps the
-compile because that is what Megatron pays; this module measures the eager
-implementation underneath it, like ``quick_gelu.py`` and
-``fused_pad_routing_map.py``.
+``native_proj_rms`` carries ``@torch.compile`` upstream. The collector keeps
+that compiled callable, matching what Megatron pays by default.
 
 ``native_proj_rms`` arrived with the mHC proj_rms stage in megatron-core 0.20;
 an older install has no ``hyper_connection`` module and is reported as such
@@ -40,6 +35,7 @@ rather than being replaced by a transcription.
 import math
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "fused_proj_rms_forward"
 DTYPES = [torch.float16, torch.bfloat16]
@@ -66,7 +62,7 @@ _MEGATRON_NATIVE_PROJ_RMS = None
 
 
 def _megatron_native_proj_rms():
-    """Megatron-LM's eager ``native_proj_rms``; raise when it is unavailable."""
+    """Megatron-LM's ``native_proj_rms``; raise when it is unavailable."""
     global _MEGATRON_NATIVE_PROJ_RMS
     if _MEGATRON_NATIVE_PROJ_RMS is None:
         try:
@@ -79,17 +75,12 @@ def _megatron_native_proj_rms():
                 f"{exc!r}. Install megatron-core from its main branch on this "
                 "machine."
             ) from exc
-        # Upstream decorates the function with @torch.compile directly, so
-        # disable_jit_fuser() cannot help; unwrap the original eager callable
-        # the collector should profile instead of Inductor output.
-        _MEGATRON_NATIVE_PROJ_RMS = getattr(
-            native_proj_rms, "_torchdynamo_orig_callable", native_proj_rms
-        )
+        _MEGATRON_NATIVE_PROJ_RMS = native_proj_rms
     return _MEGATRON_NATIVE_PROJ_RMS
 
 
 def torch_op(x, weight, eps):
-    """Megatron's eager ``native_proj_rms``; raises without Megatron."""
+    """Megatron's ``native_proj_rms``; raises without Megatron."""
     return _megatron_native_proj_rms()(x, weight, eps)
 
 
@@ -117,7 +108,14 @@ def _make_operands(M, N, K, dtype, device):
 
 def build_inputs(binding, dtype, device):
     x, weight = _make_operands(*binding["shape"], dtype, device)
-    return (x, weight, _EPS), {}
+    args = (x, weight, _EPS)
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        torch_op(*args)
+    return args, {}
 
 
 def key_shape(binding):

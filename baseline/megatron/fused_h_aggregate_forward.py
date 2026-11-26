@@ -24,13 +24,8 @@ instead of falling back to a torch composition.
 Shapes, dtypes and input construction are copied from
 ``FlagTrain/benchmark/megatron/test_fused_h_aggregate_forward.py``.
 
-``native_h_aggregate`` carries ``@torch.compile`` upstream. The collector
-profiles native kernels rather than Inductor output, so the decorator is
-unwrapped back to the eager function (``_torchdynamo_orig_callable``) -- the
-same body the benchmark's correctness suite compares against. The benchmark
-keeps the compile because that is what Megatron pays; this module measures the
-eager implementation underneath it, like ``quick_gelu.py`` and
-``fused_pad_routing_map.py``.
+``native_h_aggregate`` carries ``@torch.compile`` upstream. The collector keeps
+that compiled callable, matching what Megatron pays by default.
 
 ``native_h_aggregate`` arrived with the mHC stages in megatron-core 0.20; an
 older install has no ``hyper_connection`` module and is reported as such rather
@@ -38,6 +33,7 @@ than being replaced by a transcription.
 """
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "fused_h_aggregate_forward"
 DTYPES = [torch.float16, torch.bfloat16]
@@ -62,7 +58,7 @@ _MEGATRON_NATIVE_H_AGGREGATE = None
 
 
 def _megatron_native_h_aggregate():
-    """Megatron-LM's eager ``native_h_aggregate``; raise when unavailable."""
+    """Megatron-LM's ``native_h_aggregate``; raise when unavailable."""
     global _MEGATRON_NATIVE_H_AGGREGATE
     if _MEGATRON_NATIVE_H_AGGREGATE is None:
         try:
@@ -75,17 +71,12 @@ def _megatron_native_h_aggregate():
                 f"{exc!r}. Install megatron-core from its main branch on this "
                 "machine."
             ) from exc
-        # Upstream decorates the function with @torch.compile directly, so
-        # disable_jit_fuser() cannot help; unwrap the original eager callable
-        # the collector should profile instead of Inductor output.
-        _MEGATRON_NATIVE_H_AGGREGATE = getattr(
-            native_h_aggregate, "_torchdynamo_orig_callable", native_h_aggregate
-        )
+        _MEGATRON_NATIVE_H_AGGREGATE = native_h_aggregate
     return _MEGATRON_NATIVE_H_AGGREGATE
 
 
 def torch_op(x, h_pre):
-    """Megatron's eager ``native_h_aggregate``; raises without Megatron."""
+    """Megatron's ``native_h_aggregate``; raises without Megatron."""
     return _megatron_native_h_aggregate()(x, h_pre)
 
 
@@ -110,7 +101,14 @@ def _make_operands(s, b, n, C, dtype, device):
 def build_inputs(binding, dtype, device):
     s, b, n, C = binding["shape"]
     x, h_pre = _make_operands(s, b, n, C, dtype, device)
-    return (x, h_pre), {}
+    args = (x, h_pre)
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        torch_op(*args)
+    return args, {}
 
 
 def key_shape(binding):

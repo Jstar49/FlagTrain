@@ -15,9 +15,9 @@
 """NVIDIA baseline for tanh_soft_clamp (forward).
 
 Self-contained module; depends only on torch and megatron. ``native()`` returns
-Megatron-LM's eager ``megatron.core.activations.tanh_soft_clamp`` (Megatron's
-``jit_fuser``, i.e. ``torch.compile``, is disabled so the collector profiles
-ATen kernels rather than Inductor output). The operator was added in
+Megatron-LM's ``megatron.core.activations.tanh_soft_clamp`` as Megatron runs
+it by default (``jit_fuser`` is ``torch.compile`` on supported PyTorch
+versions). The operator was added in
 megatron-core 0.20.0; when Megatron is unavailable or the installed version
 predates it, this module raises instead of collecting a baseline or falling back
 to a torch composition. Shapes, dtypes and the scale are copied from
@@ -25,6 +25,7 @@ to a torch composition. Shapes, dtypes and the scale are copied from
 """
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "tanh_soft_clamp"
 DTYPES = [torch.float16, torch.float32, torch.bfloat16]
@@ -46,14 +47,8 @@ _SCALE = 0.5
 
 
 def base_op():
-    """Megatron-LM tanh_soft_clamp (eager); raises when unavailable."""
+    """Megatron-LM tanh_soft_clamp; raises when unavailable."""
     try:
-        import megatron.core.jit as megatron_jit
-
-        # Megatron's @jit_fuser is torch.compile by default. The collector must
-        # profile Megatron's eager kernels rather than Inductor output, so
-        # disable the fuser before activations binds the decorator.
-        megatron_jit.disable_jit_fuser()
         import megatron.core.activations
     except Exception as exc:
         raise RuntimeError(
@@ -70,9 +65,7 @@ def base_op():
             "megatron-core 0.20.0; the installed megatron-core predates it. "
             "This module does not fall back to the torch composition."
         )
-    # activations may have been imported before the fuser was disabled; in that
-    # case unwrap the torch.compile wrapper instead of compiling here.
-    return getattr(kernel, "_torchdynamo_orig_callable", kernel)
+    return kernel
 
 
 def native():
@@ -84,8 +77,14 @@ def grid():
 
 
 def build_inputs(binding, dtype, device):
-    x = torch.randn(binding["shape"], dtype=dtype, device=device)
-    return (x, _SCALE), {}
+    args = (torch.randn(binding["shape"], dtype=dtype, device=device), _SCALE)
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        native()(*args)
+    return args, {}
 
 
 def key_shape(binding):

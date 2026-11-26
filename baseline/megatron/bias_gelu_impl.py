@@ -32,17 +32,15 @@ a bias as large as the input. The two are separate bindings with distinct
 ``key_shape`` values so their baseline records cannot collide.
 
 Megatron decorates the helper behind ``bias_gelu_impl`` with ``@jit_fuser``,
-which is ``torch.compile`` on supported PyTorch versions. This module disables
-the fuser so the collector profiles the ATen kernels rather than Inductor
-output. Because ``import megatron.core`` may already have imported and wrapped
-the helper, the module is reloaded once after the fuser is disabled. Megatron is
-imported lazily on the first ``native()`` call, so ops discovery does not
-require it.
+which is ``torch.compile`` on supported PyTorch versions. This module keeps the
+compiled helper, matching Megatron's default execution. Megatron is imported
+lazily on the first ``native()`` call, so ops discovery does not require it.
 """
 
 import math
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "bias_gelu_impl"
 DTYPES = [torch.float16, torch.float32, torch.bfloat16]
@@ -72,23 +70,11 @@ _NATIVE = None
 
 
 def _megatron_bias_gelu_impl():
-    """Megatron-LM's bias_gelu_impl (eager); raise when it cannot be imported."""
+    """Megatron-LM's bias_gelu_impl; raise when it cannot be imported."""
     global _NATIVE
     if _NATIVE is None:
         try:
-            import importlib
-
-            import megatron.core.jit
-
-            # The collector profiles native kernels, not Inductor output.
-            megatron.core.jit.disable_jit_fuser()
             import megatron.core.fusions.fused_bias_gelu as fused_bias_gelu
-
-            # megatron.core imports the fusions package at import time, so the
-            # helper may already be wrapped by torch.compile. Reloading after
-            # disable_jit_fuser() rebinds @jit_fuser to the no-op decorator.
-            if hasattr(fused_bias_gelu.bias_gelu, "_torchdynamo_orig_callable"):
-                importlib.reload(fused_bias_gelu)
         except Exception as exc:
             raise RuntimeError(
                 "bias_gelu_impl baseline requires Megatron-LM's "
@@ -123,7 +109,14 @@ def build_inputs(binding, dtype, device):
         bias = torch.randn(shape, dtype=dtype, device=device)
     else:
         bias = torch.randn((shape[-1],), dtype=dtype, device=device)
-    return (input, bias), {}
+    args = (input, bias)
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        native()(*args)
+    return args, {}
 
 
 def key_shape(binding):

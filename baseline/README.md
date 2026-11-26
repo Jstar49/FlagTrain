@@ -9,6 +9,11 @@ Megatron 或 Transformer Engine，**不 import `flag_train` 或 `benchmark`**。
 shape、dtype 和输入构造与对应 benchmark 保持一致。Optest 从本仓库的 `baseline/`
 直接读取采集模块。
 
+Megatron 基线记录 Megatron 的默认执行方式：`@jit_fuser` / `@torch.compile`
+包装的函数保持编译状态，`build_inputs()` 会在计时前为每个 shape/dtype 预热一次，
+并放宽 Dynamo 的 recompile limit，避免把编译时间或静默 eager 回退计入结果。
+切换到该口径后，旧的 eager 基线记录不可直接比较。
+
 按基线实现所属的库分组：
 
 | 目录 |

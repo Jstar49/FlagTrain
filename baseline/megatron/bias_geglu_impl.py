@@ -28,17 +28,16 @@ the QuickGEGLU variants are additional FlagTrain benchmark cases and are not
 arguments of Megatron-LM's public ``bias_geglu_impl``.
 
 Megatron decorates the inner helpers of that module with ``@jit_fuser``, which
-is ``torch.compile`` on supported PyTorch versions. This module disables the
-fuser so the collector profiles the ATen kernels rather than Inductor output.
-Because ``import megatron.core`` may already have imported and wrapped the
-fusion helpers, the module is reloaded once after the fuser is disabled.
-Megatron is imported lazily on the first ``native()`` call, so operator
-discovery does not require Megatron to be installed.
+is ``torch.compile`` on supported PyTorch versions. This module keeps the
+compiled helpers, matching Megatron's default execution. Megatron is imported
+lazily on the first ``native()`` call, so operator discovery does not require
+Megatron to be installed.
 """
 
 import math
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "bias_geglu_impl"
 DTYPES = [torch.float16, torch.float32, torch.bfloat16]
@@ -60,26 +59,11 @@ _MEGATRON_BIAS_GEGLU_IMPL = None
 
 
 def _megatron_bias_geglu_impl():
-    """Megatron-LM's bias_geglu_impl (eager); raise when it cannot be imported."""
+    """Megatron-LM's bias_geglu_impl; raise when it cannot be imported."""
     global _MEGATRON_BIAS_GEGLU_IMPL
     if _MEGATRON_BIAS_GEGLU_IMPL is None:
         try:
-            import importlib
-
-            import megatron.core.jit
-
-            # The collector profiles native kernels, not Inductor output.
-            megatron.core.jit.disable_jit_fuser()
             import megatron.core.fusions.fused_bias_geglu
-
-            # megatron.core imports the fusions package at import time, so the
-            # helpers may already be wrapped by torch.compile. Reloading after
-            # disable_jit_fuser() rebinds @jit_fuser to the no-op decorator.
-            if hasattr(
-                megatron.core.fusions.fused_bias_geglu.geglu,
-                "_torchdynamo_orig_callable",
-            ):
-                importlib.reload(megatron.core.fusions.fused_bias_geglu)
         except Exception as exc:
             raise RuntimeError(
                 "bias_geglu_impl baseline requires Megatron-LM's "
@@ -107,7 +91,14 @@ def build_inputs(binding, dtype, device):
     hidden = binding["shape"][-1]
     input = torch.randn(binding["shape"], dtype=dtype, device=device)
     bias = torch.randn((hidden,), dtype=dtype, device=device)
-    return (input, bias), {}
+    args = (input, bias)
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        native()(*args)
+    return args, {}
 
 
 def key_shape(binding):

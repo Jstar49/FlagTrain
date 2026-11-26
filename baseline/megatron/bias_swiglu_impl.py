@@ -29,20 +29,15 @@ by the benchmark are collected. The clamp/SiTU arguments require megatron-core
 0.20 or newer, the version the benchmark requires for the same variants.
 
 Megatron decorates the inner helpers of that module with ``@jit_fuser``, which
-is ``torch.compile`` on torch >= 2.2. Like ``quick_gelu.py`` this module
-disables the fuser so the collector profiles the ATen kernels rather than
-Inductor output. Disabling alone is not enough here: ``import megatron.core``
-already imports the fusions package, so the helpers are wrapped before this
-module gets a chance to switch the fuser off, and the wrapper sits on the inner
-helpers rather than on the public function. The module is therefore reloaded
-once after the fuser is disabled, which rebinds the decorators to the no-op
-fuser. Megatron is imported lazily on the first ``native()`` call, so ops
-discovery does not trigger it.
+is ``torch.compile`` on torch >= 2.2. This module keeps the compiled helpers,
+matching Megatron's default execution. Megatron is imported lazily on the first
+``native()`` call, so ops discovery does not trigger it.
 """
 
 import math
 
 import torch
+from torch._dynamo import config as dynamo_config
 
 OP_NAME = "bias_swiglu_impl"
 DTYPES = [torch.float16, torch.float32, torch.bfloat16, torch.float64]
@@ -64,26 +59,11 @@ _MEGATRON_BIAS_SWIGLU_IMPL = None
 
 
 def _megatron_bias_swiglu_impl():
-    """Megatron-LM's bias_swiglu_impl (eager); raise when it cannot be imported."""
+    """Megatron-LM's bias_swiglu_impl; raise when it cannot be imported."""
     global _MEGATRON_BIAS_SWIGLU_IMPL
     if _MEGATRON_BIAS_SWIGLU_IMPL is None:
         try:
-            import importlib
-
-            import megatron.core.jit
-
-            # The collector profiles native kernels, not Inductor output.
-            megatron.core.jit.disable_jit_fuser()
             import megatron.core.fusions.fused_bias_swiglu
-
-            # megatron.core imports the fusions package at import time, so the
-            # helpers may already be wrapped by torch.compile. Reloading after
-            # disable_jit_fuser() rebinds @jit_fuser to the no-op decorator.
-            if hasattr(
-                megatron.core.fusions.fused_bias_swiglu.swiglu,
-                "_torchdynamo_orig_callable",
-            ):
-                importlib.reload(megatron.core.fusions.fused_bias_swiglu)
         except Exception as exc:
             raise RuntimeError(
                 "bias_swiglu_impl baseline requires Megatron-LM's "
@@ -129,7 +109,14 @@ def build_inputs(binding, dtype, device):
     hidden = binding["shape"][-1]
     input = torch.randn(binding["shape"], dtype=dtype, device=device)
     bias = torch.randn((hidden,), dtype=dtype, device=device)
-    return (input, bias, binding["variant"]), {}
+    args = (input, bias, binding["variant"])
+    # Compile this shape/dtype before the collector starts timing.
+    with dynamo_config.patch(
+        recompile_limit=len(grid()) * len(DTYPES) + 8,
+        fail_on_recompile_limit_hit=True,
+    ):
+        torch_op(*args)
+    return args, {}
 
 
 def key_shape(binding):
